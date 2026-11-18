@@ -45,10 +45,13 @@ class _Slot:
 
 
 class GraphedDiT:
-    def __init__(self, model, *, max_graphs: int = 64) -> None:
+    def __init__(self, model, *, max_graphs: int = 128, max_rows: int | None = None) -> None:
         self.model = model
         self.eager = model.forward_with_encoded_conditions
         self.max_graphs = int(max_graphs)
+        # Larger calls are compute-bound (graphs gave 2-4% at 8 requests) and would only multiply
+        # the number of captured shapes: run them eagerly.
+        self.max_rows = max_rows
         self.graphs: OrderedDict[tuple, tuple[torch.cuda.CUDAGraph, torch.Tensor]] = OrderedDict()
         self.slots: dict[str, _Slot] = {}
         self.pool = torch.cuda.graph_pool_handle()
@@ -124,7 +127,8 @@ class GraphedDiT:
     # -------------------------------------------------------------- call
     def __call__(self, **kwargs) -> torch.Tensor:
         x_t = kwargs["x_t"]
-        if x_t.device.type != "cuda" or self._hooked() or torch.cuda.is_current_stream_capturing():
+        if (x_t.device.type != "cuda" or self._hooked() or torch.cuda.is_current_stream_capturing()
+                or (self.max_rows is not None and x_t.shape[0] > self.max_rows)):
             return self.eager(**kwargs)
         leaves = self._flatten(kwargs)
         key = tuple((n, None) if t is None else (n, tuple(t.shape), t.dtype) for n, t in leaves)

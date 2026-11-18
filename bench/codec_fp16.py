@@ -2,7 +2,6 @@ import sys, copy, time
 from pathlib import Path
 import numpy as np, torch
 sys.path.insert(0, str(Path(__file__).resolve().parent)); import bench as B
-from irodori_tts.inference_runtime import SamplingRequest
 import argparse
 args = argparse.Namespace(model="mf", precision="fp16", codec_precision="fp32", compile=False, steps=None)
 rt = B.make_runtime(args)

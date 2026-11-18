@@ -58,8 +58,17 @@ def make_runtime(args) -> InferenceRuntime:
 
 
 def make_req(text: str, seed: int, args) -> SamplingRequest:
-    return SamplingRequest(text=text, ref_wav=str(ROOT / "bench" / "ref30.wav"), seed=seed,
-                           num_steps=args.steps)
+    extra = {}
+    if getattr(args, "cfg_min_t", None) is not None:
+        extra["cfg_min_t"] = args.cfg_min_t
+    if getattr(args, "cfg_mode", None):
+        extra["cfg_guidance_mode"] = args.cfg_mode
+    if getattr(args, "sway", None) is not None:
+        extra["t_schedule_mode"] = "sway"
+        extra["sway_coeff"] = args.sway
+    return SamplingRequest(text=text, ref_wav=str(ROOT / "bench" / "ref30.wav"),
+                           seed=seed + 7919 * getattr(args, "seed_round", 0),
+                           num_steps=args.steps, **extra)
 
 
 def run(rt, texts, batch: int, args):
@@ -70,7 +79,18 @@ def run(rt, texts, batch: int, args):
         reqs = [make_req(t, 1000 + i + j, args) for j, t in enumerate(chunk)]
         torch.cuda.synchronize()
         t0 = time.perf_counter()
-        res = (args.batcher or rt).synthesize_batch(reqs)
+        if getattr(args, "length_check", False) and args.batcher is not None:
+            res = args.batcher.synthesize_batch(reqs, length_check=True)
+            args.lc_info.extend(args.batcher.last_length_check)
+        elif getattr(args, "length_check", False):
+            from irodori_tts import length_check as lc
+            res = []
+            for r in reqs:
+                out, info = lc.synthesize(rt, r)
+                res.append(out)
+                args.lc_info.append(info)
+        else:
+            res = (args.batcher or rt).synthesize_batch(reqs)
         torch.cuda.synchronize()
         walls.append(time.perf_counter() - t0)
         for r in res:
@@ -128,11 +148,18 @@ def main() -> None:
     ap.add_argument("--wav-dir")
     ap.add_argument("--decoder-fp16", action="store_true")
     ap.add_argument("--graphs", action="store_true")
+    ap.add_argument("--cfg-min-t", type=float)
+    ap.add_argument("--length-check", action="store_true")
+    ap.add_argument("--cfg-mode")
+    ap.add_argument("--sway", type=float)
+    ap.add_argument("--seeds", type=int, default=1, help="with --wav-dir: write this many seeds per text")
     ap.add_argument("--compile-decoder", action="store_true")
     ap.add_argument("--compile-blocks", action="store_true")
+    ap.add_argument("--watermark-fp16", action="store_true")
     ap.add_argument("--fast", action="store_true", help="use irodori_tts.turing.TuringBatcher")
     ap.add_argument("--latent-multiple", type=int, default=1)
     args = ap.parse_args()
+    args.lc_info = []
 
     t0 = time.perf_counter()
     rt = make_runtime(args)
@@ -146,7 +173,8 @@ def main() -> None:
         args.batcher = TuringBatcher(rt, latent_multiple=args.latent_multiple,
                                      decoder_fp16=args.decoder_fp16, cuda_graphs=args.graphs,
                                      compile_decoder=args.compile_decoder,
-                                     compile_blocks=args.compile_blocks)
+                                     compile_blocks=args.compile_blocks,
+                                     watermark_fp16=args.watermark_fp16)
     print(f"load {time.perf_counter() - t0:.1f}s  cudnn_sdpa={os.environ.get('IRODORI_SDPA_CUDNN', '1')}",
           flush=True)
     # warm-up: every shape once
@@ -169,6 +197,10 @@ def main() -> None:
             print(f"[B=1] 1 本ずつ 平均 {statistics.mean(med):.3f}s 最大 {max(med):.3f}s  合計 {sum(med):.3f}s | {desc}")
         else:
             print(f"[B={b}] 1 呼び出し {' / '.join(f'{m:.3f}' for m in med)}s  合計 {sum(med):.3f}s")
+        if args.length_check:
+            last = args.lc_info[-len(TEXTS):]
+            print("   length_check: " + " ".join(
+                f"{i['length_check'][:5]}:{i.get('first_frames', '-')}->{i.get('estimated_frames', '-')}" for i in last))
         if args.stages:
             names = list(stage_rep[0].keys())
             print("   段ごと（1 回あたり合計 ms）: " + "  ".join(
@@ -182,8 +214,13 @@ def main() -> None:
         if args.wav_dir:
             import soundfile as sf
             d = Path(args.wav_dir); d.mkdir(parents=True, exist_ok=True)
-            for i, a in enumerate(audios):
-                sf.write(d / f"b{b}_{i}.wav", a, 48000)
+            for k in range(args.seeds):
+                if k:
+                    args.seed_round = k
+                    _, _, audios = run(rt, TEXTS, b, args)
+                for i, a in enumerate(audios):
+                    sf.write(d / f"b{b}_s{k}_{i}.wav", a, 48000)
+            args.seed_round = 0
         if args.save and b == 1:
             np.savez(args.save, **{f"a{i}": a for i, a in enumerate(audios)})
             print(f"   saved {args.save}")

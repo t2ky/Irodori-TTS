@@ -1,5 +1,5 @@
 import sys; sys.path.insert(0, __import__("os").path.dirname(__import__("os").path.dirname(__import__("os").path.abspath(__file__))))
-import time, torch, torchaudio, functools
+import time, torch, torchaudio
 from irodori_tts.watermark import SilentCipherWatermarker
 wm = SilentCipherWatermarker(device="cuda")
 x = torch.randn(48000*3) * 0.1

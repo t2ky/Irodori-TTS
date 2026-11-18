@@ -24,6 +24,10 @@
 | 4 | `irodori_tts/cuda_graphs.py` の `GraphedDiT`（`cuda_graphs`）: 形ごとに DiT の forward を CUDA グラフに、入力の置き場は全グラフで共有、フックがあるときは通常実行 | 1 本ずつは起動律速（1 回 約 1,500 カーネル・16ms） | fp32 でグラフなしと同じ出力（SNR・メルの差が一致） |
 | 5 | `get_timestep_embedding` の `log(10000)` を Python の定数に | 毎回デバイス上に tensor を作る（H2D コピー）のはグラフの捕獲中にできない | 同じ fp32 の値。出力の変化なし |
 | 6 | `compile_decoder` / `compile_blocks`: 復号器と DiT の各ブロックを `torch.compile(dynamic=True)` | Snake・norm・AdaLN などの要素ごとの演算の融合。グラフの中で動く | 復号 4 秒ぶん 15.0 → 11.6ms。長さ 8/8 一致 |
+| 7 | `synthesize_batch(..., length_check=True)`: length_check.py の 2 回生成をバッチで。最後のステップの呼び出しだけ通常実行（compile もしない）でポインタのフックを付け、全行のポインタを 1 回で取る。縮める行だけをまとめて 2 回目に回し、復号は採用した行だけ | 上流の length_check は 1 本ずつ・フック前提で、グラフや compile 済みのブロックではフックが呼ばれない | fp32 で上流（1 本ずつ）と判断が完全に一致（8 文中 3 文を同じフレーム数に縮める）、長さ 8/8 一致。12・16 ステップでも 40 と同じ行を縮めた |
+| 8 | `watermark_fp16`: SilentCipher を fp16 の autocast で | 1 本 約 10ms が文ごとに直列。行をまとめても速くならない（スペクトログラムの畳み込みが律速、試して消した） | 8 本 226 → 72ms。読めたペイロードと確信度が fp32 と同じ |
+| 9 | `graph_max_rows`（既定 8 行）・`speaker_multiple`・`latent_multiple` | グラフは形ごとなので、参照音声の長さ・潜在の長さ・行数の組み合わせで数が増える。大きいバッチは計算律速でグラフの効果が 2〜4% しかない | — |
+| 10 | `turing_server.py`: 今のローカルサーバと同じ `/synth`・`/health` で、同時に来たリクエストを窓（既定 10ms・最大 8 本）でまとめる。声は `IRODORI_VOICES_DIR` に置いて名前（`voice`）で指定できる | 本番の形（1 プロセスに 1 版） | 下の負荷試験 |
 
 ## 計測（ps00 の 3090、`bench/bench.py`、参照 34 秒、チャットの 8 文、透かしなし）
 
@@ -41,3 +45,44 @@
 bench/run.sh --model mf --precision fp16 --decoder-fp16 --graphs --compile-decoder --compile-blocks \
   --fast --batch 1,8 --stages --compare bench/out/mf_fp32_b1.npz   # 基準は --save で先に作る
 ```
+
+長さ補正・透かしを入れた本番相当（Small）:
+
+| Small・8 本（fp16・手当 1〜8・長さ補正あり、透かしなし） | 8 本で 1 回 |
+|---|---|
+| 40 ステップ | 1.35 |
+| 16 ステップ・sway −1 | 0.74 |
+| 12 ステップ・sway −1 | 0.60 |
+| 12 ステップ | 0.57 |
+
+## 品質の目安（`bench/eval_quality.py`、8 文 × 3 シード）
+
+faster-whisper large-v3 の CER と、WavLM-SV（microsoft/wavlm-base-plus-sv）の参照音声とのコサイン類似度。
+「うん。」は長さ補正なしだと必ず余計な発話が付く（CER 100〜350%）ので除いて比べた。
+
+- fp16 の高速経路は上流の fp32 と同等（Small 40: CER 2.5% 対 2.7%、類似度 0.896 対 0.896）
+- ステップ数・sway・CFG の掛け方を変えても CER は 2.5〜2.7% で差がない。類似度は 40: 0.896、24: 0.891、16: 0.890、12: 0.883、16 sway: 0.893、12 sway: 0.896、CFG t≥0.7: 0.885、alternating: 0.848。短い 2 文を除くとすべて 0.92〜0.93 で、この指標では見分けられない（同じ話者なら 0.91〜0.95 に集まる）。**決めるのは耳**
+- 長さ補正で「うん。」を含む全体の CER が 29% → 2.2%
+
+## 負荷試験（`turing_server.py` ＋ `bench/load.py`、3090、透かしあり、声は名前で指定）
+
+| | 同時 8 本 平均／最大 | 1 本 | ポアソン |
+|---|---|---|---|
+| MF | 0.316 ／ 0.492 | 0.087 | 8/s: p95 0.202、16/s: p95 0.359 |
+| Small 40 ステップ | 1.574 ／ 1.765 | 0.322 | 4/s: p95 2.30、8/s: 処理が追いつかない |
+| Small 16 ステップ・sway | 0.938 ／ 1.142 | 0.208 | 4/s: p95 0.62、8/s: p95 1.85 |
+
+秒。リクエストごとに参照音声（34 秒・base64 で約 3MB）を送ると、同時 8 本が 0.49 秒・バッチが平均 6.2 本に崩れた（解析がイベントループで直列）。本番は声を登録して名前で指定する。
+
+```bash
+IRODORI_MODEL=small-mf IRODORI_PORT=8099 IRODORI_VOICES_DIR=<dir> bench/serve.sh   # 止めるのは bench/stop_server.sh 8099
+python3 bench/load.py --voice <name> burst --n 8 --rounds 10
+```
+
+## 罠
+
+- `pkill -f <スクリプト名>` は呼んだシェル自身のコマンド行にも一致して、シェルごと落ちる。止めるのはポートから PID を引く `bench/stop_server.sh`
+- コーデックを fp16 にすると参照音声のエンコードも fp16 になり、話者状態がずれて長さが変わる。fp16 にするのは復号器だけ
+- compile 済みのブロックは attention を取り込むので、あとから attention に付けたフックが呼ばれない
+- CUDA グラフの入力の置き場を広げると捕獲済みのグラフは無効になり、空になったプールにはもう捕獲できない（新しいプールを作る）。温めは大きい形から
+- 透かしを入れていない音声でも SilentCipher の検出が「あり」になることがある（2/8）。短い音声では fp32 でも 1 バイト目の読み違い・検出漏れがある。上流の性質

@@ -221,3 +221,4 @@ outputs/
 data/
 bench/*.wav
 bench/out/
+bench/voices/
