@@ -99,7 +99,7 @@ def default_runtime_device() -> str:
 def list_available_runtime_precisions(device: str | torch.device) -> list[str]:
     resolved = resolve_runtime_device(device)
     if resolved.type in ("cuda", "xpu"):
-        return ["fp32", "bf16"]
+        return ["fp32", "bf16", "fp16"]
     return ["fp32"]
 
 
@@ -405,7 +405,12 @@ def resolve_runtime_dtype(*, precision: str, device: torch.device) -> torch.dtyp
         if device.type not in ("cuda", "xpu"):
             raise ValueError("precision='bf16' currently requires CUDA or XPU device.")
         return torch.bfloat16
-    raise ValueError(f"Unsupported precision={precision!r}. Expected one of: fp32, bf16.")
+    if mode == "fp16":
+        # Turing (sm75) has fp16 tensor cores but no fast bf16 (TURING.md).
+        if device.type not in ("cuda", "xpu"):
+            raise ValueError("precision='fp16' currently requires CUDA or XPU device.")
+        return torch.float16
+    raise ValueError(f"Unsupported precision={precision!r}. Expected one of: fp32, bf16, fp16.")
 
 
 def resolve_cfg_scales(

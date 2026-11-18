@@ -49,11 +49,16 @@ def apply_rotary_emb(x: torch.Tensor, freqs_cis: torch.Tensor) -> torch.Tensor:
     return x_.type_as(x)
 
 
+# fp32 log(10000) as a Python scalar: a device tensor built per call is a host-to-device copy, which
+# CUDA graph capture does not allow (TURING.md). Same fp32 value as before.
+_LOG_10000 = float(torch.log(torch.tensor(10000.0, dtype=torch.float32)))
+
+
 def get_timestep_embedding(timestep: torch.Tensor, dim: int) -> torch.Tensor:
     assert dim % 2 == 0
     half = dim // 2
     freqs = 1000.0 * torch.exp(
-        -torch.log(torch.tensor(10000.0, device=timestep.device, dtype=torch.float32))
+        -_LOG_10000
         * torch.arange(half, device=timestep.device, dtype=torch.float32)
         / half
     )
