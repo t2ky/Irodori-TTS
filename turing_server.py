@@ -17,8 +17,10 @@ env: IRODORI_MODEL=small|small-mf  IRODORI_PORT=8097  IRODORI_HOST=127.0.0.1
      IRODORI_LENGTH_CHECK=1  IRODORI_DEFAULT_SEED=0  IRODORI_DEFAULT_STEPS / IRODORI_SWAY (RF only)
      IRODORI_WARMUP=1  IRODORI_WARMUP_REF=<wav>  IRODORI_COMPILE=1  IRODORI_GRAPHS=1
      IRODORI_LATENT_MULTIPLE=16  IRODORI_SPEAKER_MULTIPLE=64  IRODORI_GRAPH_MAX_ROWS=8
-     IRODORI_VOICES_DIR=<dir of <name>.wav>: voices selectable by name (no upload per request; the
-     first one also warms up the server)
+     IRODORI_VOICES_DIR=<dir of <name>.wav | <name>.pt>: voices selectable by name (no upload per
+     request; the first one also warms up the server). <name>.pt is a reference latent made by
+     bench/make_latent.py: the server then never runs the codec encoder (no VRAM peak for it)
+     IRODORI_ALLOW_REF_AUDIO=0: refuse "ref_audio" uploads (registered voices only)
 
 Privacy: request text / caption are never logged or written to disk; reference audio is written
 once (named by its sha256) to a private tmpfs dir for the runtime's latent cache and removed at
@@ -78,6 +80,19 @@ SWAY = float(os.environ["IRODORI_SWAY"]) if os.environ.get("IRODORI_SWAY") else 
 FLAG = lambda name, default="1": os.environ.get(name, default) not in ("0", "false", "off")  # noqa: E731
 VOICES_DIR = Path(os.environ["IRODORI_VOICES_DIR"]) if os.environ.get("IRODORI_VOICES_DIR") else None
 MAX_TEXT_CHARS = 300
+# IRODORI_ALLOW_REF_AUDIO=0: refuse uploaded references (encoding one is a transient VRAM peak of
+# ~1.4GB for 30-120 s of audio, too much next to another tenant on the same GPU)
+ALLOW_REF_AUDIO = FLAG("IRODORI_ALLOW_REF_AUDIO")
+
+
+def _voice_files() -> dict[str, Path]:
+    """name -> file in IRODORI_VOICES_DIR; a precomputed latent (<name>.pt) wins over <name>.wav."""
+    if VOICES_DIR is None:
+        return {}
+    out: dict[str, Path] = {}
+    for p in sorted(VOICES_DIR.glob("*.wav")) + sorted(VOICES_DIR.glob("*.pt")):
+        out[p.stem] = p
+    return dict(sorted(out.items()))
 MAX_REF_BYTES = 30 * 1024 * 1024
 
 _state: dict = {}
@@ -192,6 +207,10 @@ def _request(text, ref_wav, caption, seed, num_steps, cfg) -> SamplingRequest:
     rt = _state["rt"]
     caption = caption.strip() if caption and caption.strip() else None
     use_spk = bool(rt.model_cfg.use_speaker_condition_resolved and ref_wav is not None)
+    # a voice may be a precomputed reference latent (<name>.pt, see bench/make_latent.py): no codec
+    # encode on the server, so no transient VRAM peak for the reference
+    ref_kw = ({} if ref_wav is None else
+              {"ref_latent": ref_wav} if ref_wav.endswith(".pt") else {"ref_wav": ref_wav})
     t, c, s, _ = resolve_cfg_scales(
         cfg_guidance_mode="independent", cfg_scale_text=cfg.get("text", 3.0),
         cfg_scale_caption=cfg.get("caption", 3.0), cfg_scale_speaker=cfg.get("speaker", 5.0),
@@ -204,7 +223,7 @@ def _request(text, ref_wav, caption, seed, num_steps, cfg) -> SamplingRequest:
     if SWAY is not None and rt.model_cfg.flow_parameterization != "meanflow":
         sway = {"t_schedule_mode": "sway", "sway_coeff": SWAY}
     return SamplingRequest(
-        text=text, caption=caption, ref_wav=ref_wav, no_ref=ref_wav is None,
+        text=text, caption=caption, **ref_kw, no_ref=ref_wav is None,
         cfg_scale_text=t, cfg_scale_caption=c, cfg_scale_speaker=s, seed=seed, num_steps=steps,
         **sway,
     )
@@ -236,9 +255,9 @@ async def lifespan(app: FastAPI):
     log.warning("loaded %s (%s) in %.1fs", MODEL, PRECISION, time.perf_counter() - t0)
     if FLAG("IRODORI_WARMUP"):
         warm_ref = os.environ.get("IRODORI_WARMUP_REF")
-        voices = sorted(VOICES_DIR.glob("*.wav")) if VOICES_DIR else []
+        voices = _voice_files()
         if not warm_ref and voices:
-            warm_ref = str(voices[0])
+            warm_ref = str(next(iter(voices.values())))
         if not warm_ref:
             # a synthetic 10 s reference so that warm-up exercises the fast (reference) path
             sr = 48000
@@ -303,7 +322,7 @@ def health():
         "max_batch": MAX_BATCH,
         "batch_window_ms": WINDOW * 1000.0,
         "batches": _state["worker"].batches if "worker" in _state else 0,
-        "voices": sorted(p.stem for p in VOICES_DIR.glob("*.wav")) if VOICES_DIR else [],
+        "voices": sorted(_voice_files()),
     }
 
 
@@ -312,10 +331,12 @@ async def synth(body: SynthIn):
     if body.model not in (None, MODEL):
         raise HTTPException(400, f"this server runs model {MODEL!r} only")
     if body.voice is not None:
-        path = VOICES_DIR / f"{body.voice}.wav" if VOICES_DIR else None
-        if path is None or not path.is_file():
+        path = _voice_files().get(body.voice)
+        if path is None:
             raise HTTPException(400, "unknown voice")
         ref = str(path)
+    elif body.ref_audio and not ALLOW_REF_AUDIO:
+        raise HTTPException(400, "ref_audio is disabled on this server (use a registered voice)")
     else:
         ref = (await asyncio.to_thread(_ref_path, body.ref_audio)) if body.ref_audio else None
     seed = DEFAULT_SEED if body.seed is None else int(body.seed)

@@ -1,0 +1,37 @@
+# Batching TTS server (turing_server.py) as a container image.
+#
+#   docker build -f docker/Dockerfile.server \
+#     --build-context hf=$HOME/.cache/huggingface/hub -t irodori-tts-server:<tag> .
+#
+# The `hf` build context is a Hugging Face hub cache that already holds the models below, so the
+# image runs offline (HF_HUB_OFFLINE=1) and starts without network access. Reference voices are not
+# baked in: mount a directory of <name>.wav and point IRODORI_VOICES_DIR at it.
+# torch wheels bundle CUDA / cuDNN, so a plain Python base is enough (needs a driver for CUDA 12.8).
+FROM python:3.10-slim-bookworm
+
+# gcc: torch.compile (inductor / triton) builds small C helpers at run time. git: git dependencies.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      gcc g++ git libsndfile1 ffmpeg curl ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+COPY --from=ghcr.io/astral-sh/uv:0.9.7 /uv /usr/local/bin/uv
+
+WORKDIR /app
+ENV UV_LINK_MODE=copy UV_COMPILE_BYTECODE=1 UV_PROJECT_ENVIRONMENT=/opt/venv
+COPY pyproject.toml uv.lock ./
+RUN uv sync --frozen --no-install-project --no-dev --extra cu128 && rm -rf /root/.cache
+
+ENV HF_HOME=/opt/hf HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1
+COPY --from=hf models--Aratako--Irodori-TTS-v4.1-Small-MF /opt/hf/hub/models--Aratako--Irodori-TTS-v4.1-Small-MF
+COPY --from=hf models--Aratako--Irodori-TTS-v4.1-Small    /opt/hf/hub/models--Aratako--Irodori-TTS-v4.1-Small
+COPY --from=hf models--Aratako--Semantic-DACVAE-Japanese-32dim /opt/hf/hub/models--Aratako--Semantic-DACVAE-Japanese-32dim
+COPY --from=hf models--sony--silentcipher /opt/hf/hub/models--sony--silentcipher
+
+COPY irodori_tts ./irodori_tts
+COPY turing_server.py ./
+COPY bench/bench.py bench/load.py bench/mem.py bench/make_latent.py bench/texts.json ./bench/
+
+ENV PATH=/opt/venv/bin:$PATH PYTHONUNBUFFERED=1 PYTHONWARNINGS=ignore \
+    IRODORI_HOST=0.0.0.0 IRODORI_PORT=8097 \
+    TORCHINDUCTOR_CACHE_DIR=/cache/inductor TRITON_CACHE_DIR=/cache/triton
+EXPOSE 8097
+CMD ["python", "turing_server.py"]

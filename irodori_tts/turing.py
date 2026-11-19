@@ -190,7 +190,8 @@ class TuringBatcher:
             and int(req.num_candidates or 1) == 1
             and req.ref_embed is None
             and not req.no_ref
-            and (req.ref_wav is not None or bool(req.ref_wavs))
+            and (req.ref_wav is not None or bool(req.ref_wavs)
+                 or req.ref_latent is not None or bool(req.ref_latents))
             and str(req.speaker_uncond_mode).strip().lower() == "mask"
             and rt.model_cfg.use_speaker_condition_resolved
             and getattr(rt.model, "speaker_inversion", None) is None
@@ -204,7 +205,10 @@ class TuringBatcher:
             rt.default_max_ref_seconds if req.max_ref_seconds is None else float(req.max_ref_seconds)
         )
         wav_paths = ([req.ref_wav] if req.ref_wav is not None else []) + list(req.ref_wavs or [])
-        key = (_reference_latent_key(req, wav_paths, max_ref_seconds), rt.model.dtype)
+        # precomputed reference latents (.pt) are files too: key on them as well, otherwise every
+        # latent-only request has the same (empty) key and gets the first voice's speaker state
+        latent_paths = ([req.ref_latent] if req.ref_latent is not None else []) + list(req.ref_latents or [])
+        key = (_reference_latent_key(req, wav_paths + latent_paths, max_ref_seconds), rt.model.dtype)
         hit = self._speaker_cache.get(key)
         if hit is not None:
             self._speaker_cache.move_to_end(key)

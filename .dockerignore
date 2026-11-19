@@ -1,0 +1,8 @@
+.git
+.venv
+bench/out
+bench/*.wav
+bench/voices
+outputs
+logs
+**/__pycache__
