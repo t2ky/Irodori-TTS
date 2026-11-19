@@ -130,6 +130,7 @@ class TuringBatcher:
         decoder_fp16: bool = False,
         cuda_graphs: bool = False,
         graph_max_rows: int | None = 8,
+        graph_max_graphs: int = 512,
         speaker_multiple: int = 1,
         compile_decoder: bool = False,
         compile_blocks: bool = False,
@@ -180,7 +181,7 @@ class TuringBatcher:
         if cuda_graphs:
             from .cuda_graphs import GraphedDiT
 
-            self.graphs = GraphedDiT(runtime.model, max_rows=graph_max_rows)
+            self.graphs = GraphedDiT(runtime.model, max_rows=graph_max_rows, max_graphs=graph_max_graphs)
         # The text encoder (ModernBERT, ~870 small kernels per call whatever the batch) under CUDA
         # graphs, one per (rows, padded tokens): on a slow CPU it is launch-bound (Xeon E5-2695 v2:
         # 46 ms for one row). Independent of ``cuda_graphs`` (the DiT's). See warm_encoder.
@@ -192,6 +193,7 @@ class TuringBatcher:
         # Pad the speaker state (masked) to a multiple of this many tokens so that references of
         # different lengths share DiT shapes (CUDA graphs are per shape). 1 = exact.
         self.speaker_multiple = max(1, int(speaker_multiple))
+        self.speaker_pad_to = 0  # set by warm_dit from the registered voices
         self._decoder16 = None
         if decoder_fp16:
             dac = runtime.codec.model
@@ -330,6 +332,58 @@ class TuringBatcher:
         self.encoder_graphs.freeze()
         return len(self.encoder_graphs.graphs)
 
+    def speaker_length(self, req: SamplingRequest) -> int:
+        """Speaker tokens of a request's reference before padding (cached speaker state)."""
+        with self.rt._infer_lock, torch.inference_mode():
+            return int(self._speaker_state(req, [])[0].shape[1])
+
+    def _text_of_tokens(self, tokens: int) -> str:
+        """A text whose padded token length is ``tokens`` (a multiple of pad_multiple)."""
+        rt = self.rt
+        base = "あいうえおかきくけこさしすせそたちつてとなにぬねの"
+        text = "あ"
+        for n in range(1, 1000):
+            cand = (base * 40)[:n] + "。"
+            from .text_normalization import normalize_text
+
+            got = int(rt.tokenizer.batch_encode([normalize_text(cand)], max_length=rt.default_text_max_len)[1].sum())
+            if got > tokens:
+                break
+            text = cand
+            if got > tokens - self.pad_multiple:
+                return text
+        return text
+
+    def warm_dit(self, refs: Sequence[dict], *, max_rows: int, max_tokens: int, max_seconds: float) -> int:
+        """Capture the DiT graphs for every (rows 1..max_rows, text tokens per pad_multiple up to
+        max_tokens, latent length per latent_multiple up to max_seconds) and freeze them. ``refs``
+        are SamplingRequest reference kwargs of the voices (e.g. {"ref_latent": path}): they are all
+        padded to the longest one (speaker_pad_to), so the grid covers every voice. Only the
+        sampling runs (no decode). Shapes outside the grid run eagerly afterwards."""
+        if self.graphs is None:
+            return 0
+        rt = self.rt
+        lens = [self.speaker_length(SamplingRequest(text="-", **r)) for r in refs]
+        need = max(lens)
+        self.speaker_pad_to = int(math.ceil(need / self.speaker_multiple) * self.speaker_multiple)
+        sr = int(rt.codec.sample_rate)
+        hop = int(rt.codec.model.hop_length)
+        patch = int(rt.model_cfg.latent_patch_size)
+        step = max(1, self.latent_multiple)
+        max_steps = int(math.ceil(max_seconds * sr / hop / patch / step) * step)
+        texts = {t: self._text_of_tokens(t) for t in range(self.pad_multiple, max_tokens + 1, self.pad_multiple)}
+        ref = refs[0]
+        for rows in range(max_rows, 0, -1):
+            for t in sorted(texts, reverse=True):
+                for steps in range(max_steps, 0, -step):
+                    seconds = (steps * patch * hop - hop // 2) / sr
+                    reqs = [SamplingRequest(text=texts[t], seed=i, seconds=max(0.5, seconds), **ref)
+                            for i in range(rows)]
+                    with rt._infer_lock, torch.inference_mode():
+                        self._sample(reqs, [], lambda m: None)
+        self.graphs.freeze()
+        return len(self.graphs.graphs)
+
     @contextlib.contextmanager
     def _reuse_encoded(self, encoded, *, use_graphs: bool = True, recorder=None, last_call: int = 0):
         """Make the sampler's single encode_conditions call return the batch's encoded conditions,
@@ -400,7 +454,11 @@ class TuringBatcher:
         spk = [self._speaker_state(p.req, p.messages) for p in plans]
         speaker_state = _right_pad_cat([s for s, _ in spk])
         speaker_mask = _right_pad_cat([m for _, m in spk])
-        extra = -speaker_state.shape[1] % self.speaker_multiple
+        if self.speaker_pad_to and speaker_state.shape[1] < self.speaker_pad_to:
+            # every voice padded (masked) to one length, so all voices share the DiT graphs
+            extra = self.speaker_pad_to - speaker_state.shape[1]
+        else:
+            extra = -speaker_state.shape[1] % self.speaker_multiple
         if extra:
             speaker_state = torch.nn.functional.pad(speaker_state, (0, 0, 0, extra))
             speaker_mask = torch.nn.functional.pad(speaker_mask, (0, extra))

@@ -30,6 +30,8 @@ env: IRODORI_MODEL=small|small-mf  IRODORI_PORT=8097  IRODORI_HOST=127.0.0.1
      IRODORI_GRAPH_ENCODER=0: no CUDA graphs for the text encoder (default: shapes up to
      IRODORI_ENCODER_GRAPH_TOKENS=96 tokens captured at warm-up; longer sentences run eagerly)
      IRODORI_FAST_WATERMARK=0: the packaged SilentCipher encode (default: same output, no host round trips)
+     IRODORI_GRAPH_WARM_ROWS=4 / _TOKENS=64 / _SECONDS=15: the DiT shapes captured at warm-up (with
+     IRODORI_GRAPHS=1 and registered voices); other shapes run eagerly after the freeze
      IRODORI_WARMUP_LONG_TEXT: the longest text of the warm-up; it sizes the graphs (see _warmup)
 
 Privacy: request text / caption are never logged or written to disk; reference audio is written
@@ -252,6 +254,18 @@ def _warmup(worker: BatchWorker, ref_wav: str | None) -> None:
             reqs = [_request(texts[(k + i) % len(texts)], ref_wav, None, k + i, None, {}) for i in range(n)]
             worker.run(reqs, watermark=True)
             k += n
+    if worker.batcher.graphs is not None and FLAG("IRODORI_GRAPH_FREEZE") and _voice_files():
+        # every DiT shape a chat produces, so that none runs eagerly after the freeze (on Turing an
+        # eager DiT call costs ~3x a replay; without this grid every sentence missed the graphs)
+        t1 = time.perf_counter()
+        refs = [({"ref_latent": str(v)} if v.suffix == ".pt" else {"ref_wav": str(v)})
+                for v in _voice_files().values()]
+        n = worker.batcher.warm_dit(
+            refs, max_rows=int(os.environ.get("IRODORI_GRAPH_WARM_ROWS", "4")),
+            max_tokens=int(os.environ.get("IRODORI_GRAPH_WARM_TOKENS", "64")),
+            max_seconds=float(os.environ.get("IRODORI_GRAPH_WARM_SECONDS", "15")))
+        log.warning("DiT graphs: %d in %.1fs (speaker padded to %d)", n, time.perf_counter() - t1,
+                    worker.batcher.speaker_pad_to)
     t1 = time.perf_counter()
     # tokens are ~2 characters each: 96 covers sentences up to ~190 characters; longer ones run the
     # encoder eagerly. Every captured shape keeps its output in the graph pool, which the allocator
@@ -322,6 +336,7 @@ async def lifespan(app: FastAPI):
         latent_multiple=int(os.environ.get("IRODORI_LATENT_MULTIPLE", "16")),
         speaker_multiple=int(os.environ.get("IRODORI_SPEAKER_MULTIPLE", "64")),
         graph_max_rows=int(os.environ.get("IRODORI_GRAPH_MAX_ROWS", "8")),
+        graph_max_graphs=int(os.environ.get("IRODORI_GRAPH_MAX_GRAPHS", "512")),
         graph_encoder=FLAG("IRODORI_GRAPH_ENCODER"),
         fast_watermark=FLAG("IRODORI_FAST_WATERMARK"),
         sync_timings=False,
