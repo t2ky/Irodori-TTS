@@ -258,10 +258,9 @@ def _warmup(worker: BatchWorker, ref_wav: str | None) -> None:
         # every DiT shape a chat produces, so that none runs eagerly after the freeze (on Turing an
         # eager DiT call costs ~3x a replay; without this grid every sentence missed the graphs)
         t1 = time.perf_counter()
-        refs = [({"ref_latent": str(v)} if v.suffix == ".pt" else {"ref_wav": str(v)})
-                for v in _voice_files().values()]
+        voices = [str(v) for v in _voice_files().values()]
         n = worker.batcher.warm_dit(
-            refs, max_rows=int(os.environ.get("IRODORI_GRAPH_WARM_ROWS", "4")),
+            lambda text, seed: [_request(text, v, None, seed, None, {}) for v in voices], max_rows=int(os.environ.get("IRODORI_GRAPH_WARM_ROWS", "4")),
             max_tokens=int(os.environ.get("IRODORI_GRAPH_WARM_TOKENS", "64")),
             max_seconds=float(os.environ.get("IRODORI_GRAPH_WARM_SECONDS", "15")))
         log.warning("DiT graphs: %d in %.1fs (speaker padded to %d)", n, time.perf_counter() - t1,

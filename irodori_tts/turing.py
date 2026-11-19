@@ -354,16 +354,24 @@ class TuringBatcher:
                 return text
         return text
 
-    def warm_dit(self, refs: Sequence[dict], *, max_rows: int, max_tokens: int, max_seconds: float) -> int:
+    def warm_dit(self, make_request: Callable[[str, int], Sequence[SamplingRequest]] | Sequence[dict], *,
+                 max_rows: int, max_tokens: int, max_seconds: float) -> int:
         """Capture the DiT graphs for every (rows 1..max_rows, text tokens per pad_multiple up to
-        max_tokens, latent length per latent_multiple up to max_seconds) and freeze them. ``refs``
-        are SamplingRequest reference kwargs of the voices (e.g. {"ref_latent": path}): they are all
-        padded to the longest one (speaker_pad_to), so the grid covers every voice. Only the
-        sampling runs (no decode). Shapes outside the grid run eagerly afterwards."""
+        max_tokens, latent length per latent_multiple up to max_seconds) and freeze them.
+        ``make_request(text, seed)`` returns one request per registered voice, built exactly as the
+        server builds them (CFG scales and steps decide the DiT's rows and calls); or pass reference
+        kwargs ({"ref_latent": path}, ...) for default requests. The voices are padded to the longest
+        one (speaker_pad_to), so the grid covers every voice. Only the sampling runs (no decode).
+        Shapes outside the grid run eagerly afterwards."""
         if self.graphs is None:
             return 0
         rt = self.rt
-        lens = [self.speaker_length(SamplingRequest(text="-", **r)) for r in refs]
+        if not callable(make_request):
+            refs = list(make_request)
+
+            def make_request(text, seed):  # noqa: F811
+                return [SamplingRequest(text=text, seed=seed, **r) for r in refs]
+        lens = [self.speaker_length(r) for r in make_request("-", 0)]
         need = max(lens)
         self.speaker_pad_to = int(math.ceil(need / self.speaker_multiple) * self.speaker_multiple)
         sr = int(rt.codec.sample_rate)
@@ -372,12 +380,11 @@ class TuringBatcher:
         step = max(1, self.latent_multiple)
         max_steps = int(math.ceil(max_seconds * sr / hop / patch / step) * step)
         texts = {t: self._text_of_tokens(t) for t in range(self.pad_multiple, max_tokens + 1, self.pad_multiple)}
-        ref = refs[0]
         for rows in range(max_rows, 0, -1):
             for t in sorted(texts, reverse=True):
                 for steps in range(max_steps, 0, -step):
                     seconds = (steps * patch * hop - hop // 2) / sr
-                    reqs = [SamplingRequest(text=texts[t], seed=i, seconds=max(0.5, seconds), **ref)
+                    reqs = [dataclasses.replace(make_request(texts[t], i)[0], seconds=max(0.5, seconds))
                             for i in range(rows)]
                     with rt._infer_lock, torch.inference_mode():
                         self._sample(reqs, [], lambda m: None)
