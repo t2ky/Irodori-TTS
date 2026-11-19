@@ -6,10 +6,11 @@ for more (at most IRODORI_MAX_BATCH), and runs the compatible ones as one Turing
 (fp16, CUDA graphs, compiled blocks / decoder, batched length check).
 
   POST /synth  {"text", "voice"?(name in IRODORI_VOICES_DIR) | "ref_audio"?(base64 wav),
-                "caption"?, "seed"?, "num_steps"?,
+                "caption"?, "seed"?, "num_steps"?, "speaker_kv_scale"?,
                 "cfg_scale_text"?, "cfg_scale_caption"?, "cfg_scale_speaker"?, "watermark"?}
             -> {"sample_rate", "audio"(base64 int16 LE mono), "seconds", "batch_size",
                 "audio_seconds", "model", "seed", "watermarked"}
+  POST /tts    same body -> audio/wav (IRODORI_OUTPUT_SR=24000, mono, PCM 16), what the app plays
   GET  /health
 
 env: IRODORI_MODEL=small|small-mf  IRODORI_PORT=8097  IRODORI_HOST=127.0.0.1
@@ -17,7 +18,8 @@ env: IRODORI_MODEL=small|small-mf  IRODORI_PORT=8097  IRODORI_HOST=127.0.0.1
      IRODORI_LENGTH_CHECK=1  IRODORI_DEFAULT_SEED=0  IRODORI_DEFAULT_STEPS / IRODORI_SWAY (RF only)
      IRODORI_WARMUP=1  IRODORI_WARMUP_REF=<wav>  IRODORI_COMPILE=1  IRODORI_GRAPHS=1
      IRODORI_LATENT_MULTIPLE=16  IRODORI_SPEAKER_MULTIPLE=64  IRODORI_GRAPH_MAX_ROWS=8
-     IRODORI_VOICES_DIR=<dir of <name>.wav | <name>.pt>: voices selectable by name (no upload per
+     IRODORI_VOICES_DIR=<dir of <name>.wav | <name>.pt | <name>.speaker.safetensors (Speaker Inversion),
+     and voices.json with per-voice cfg_scale_speaker / speaker_kv_scale / num_steps>: voices selectable by name (no upload per
      request; the first one also warms up the server). <name>.pt is a reference latent made by
      bench/make_latent.py: the server then never runs the codec encoder (no VRAM peak for it)
      IRODORI_ALLOW_REF_AUDIO=0: refuse "ref_audio" uploads (registered voices only)
@@ -47,6 +49,7 @@ import concurrent.futures
 import dataclasses
 import hashlib
 import io
+import json
 import logging
 import os
 import queue
@@ -62,7 +65,7 @@ import numpy as np
 import soundfile as sf
 import torch
 from fastapi import FastAPI, HTTPException
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel, Field
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -118,14 +121,44 @@ WARMUP_TEXTS = [
 ]
 
 
+_EMBED_SUFFIX = ".speaker.safetensors"
+
+
 def _voice_files() -> dict[str, Path]:
-    """name -> file in IRODORI_VOICES_DIR; a precomputed latent (<name>.pt) wins over <name>.wav."""
+    """name -> file in IRODORI_VOICES_DIR. A Speaker Inversion embedding (<name>.speaker.safetensors)
+    wins over a precomputed latent (<name>.pt), which wins over <name>.wav."""
     if VOICES_DIR is None:
         return {}
     out: dict[str, Path] = {}
-    for p in sorted(VOICES_DIR.glob("*.wav")) + sorted(VOICES_DIR.glob("*.pt")):
-        out[p.stem] = p
+    for p in (sorted(VOICES_DIR.glob("*.wav")) + sorted(VOICES_DIR.glob("*.pt"))
+              + sorted(VOICES_DIR.glob("*" + _EMBED_SUFFIX))):
+        name = p.name[: -len(_EMBED_SUFFIX)] if p.name.endswith(_EMBED_SUFFIX) else p.stem
+        out[name] = p
     return dict(sorted(out.items()))
+
+
+_voice_settings_cache: dict | None = None
+
+
+def _voice_settings() -> dict[str, dict]:
+    """Per-voice defaults from IRODORI_VOICES_DIR/voices.json:
+    {"<name>": {"cfg_scale_speaker": 2.0, "speaker_kv_scale": 1.5, "num_steps": 10}, ...}.
+    A request's own values win. A voice learned with Speaker Inversion is read with a weak speaker CFG
+    and a K/V scale (the setting the voices were chosen with)."""
+    global _voice_settings_cache
+    if _voice_settings_cache is None:
+        p = VOICES_DIR / "voices.json" if VOICES_DIR is not None else None
+        _voice_settings_cache = json.loads(p.read_text()) if p is not None and p.exists() else {}
+    return _voice_settings_cache
+
+
+def _voice_name(path: str | None) -> str | None:
+    if path is None:
+        return None
+    for name, p in _voice_files().items():
+        if str(p) == path:
+            return name
+    return None
 MAX_REF_BYTES = 30 * 1024 * 1024
 
 _state: dict = {}
@@ -283,13 +316,20 @@ def _warmup(worker: BatchWorker, ref_wav: str | None) -> None:
                 len(graphs.graphs) if graphs else 0)
 
 
-def _request(text, ref_wav, caption, seed, num_steps, cfg) -> SamplingRequest:
+def _request(text, ref_wav, caption, seed, num_steps, cfg, kv_scale=None) -> SamplingRequest:
     rt = _state["rt"]
     caption = caption.strip() if caption and caption.strip() else None
     use_spk = bool(rt.model_cfg.use_speaker_condition_resolved and ref_wav is not None)
-    # a voice may be a precomputed reference latent (<name>.pt, see bench/make_latent.py): no codec
-    # encode on the server, so no transient VRAM peak for the reference
+    # the registered voice's defaults (voices.json), under the request's own values
+    vs = _voice_settings().get(_voice_name(ref_wav) or "", {})
+    cfg = {"speaker": vs["cfg_scale_speaker"], **cfg} if "cfg_scale_speaker" in vs else cfg
+    kv_scale = vs.get("speaker_kv_scale") if kv_scale is None else kv_scale
+    num_steps = vs.get("num_steps") if num_steps is None else num_steps
+    # a voice may be a Speaker Inversion embedding (<name>.speaker.safetensors) or a precomputed
+    # reference latent (<name>.pt, see bench/make_latent.py): no codec encode on the server, so no
+    # transient VRAM peak for the reference
     ref_kw = ({} if ref_wav is None else
+              {"ref_embed": ref_wav} if ref_wav.endswith(_EMBED_SUFFIX) else
               {"ref_latent": ref_wav} if ref_wav.endswith(".pt") else {"ref_wav": ref_wav})
     t, c, s, _ = resolve_cfg_scales(
         cfg_guidance_mode="independent", cfg_scale_text=cfg.get("text", 3.0),
@@ -305,6 +345,9 @@ def _request(text, ref_wav, caption, seed, num_steps, cfg) -> SamplingRequest:
     return SamplingRequest(
         text=text, caption=caption, **ref_kw, no_ref=ref_wav is None,
         cfg_scale_text=t, cfg_scale_caption=c, cfg_scale_speaker=s, seed=seed, num_steps=steps,
+        # RF only (MeanFlow ignores it); a batch shares one value (it is in the compatibility key)
+        speaker_kv_scale=(kv_scale if use_spk and rt.model_cfg.flow_parameterization != "meanflow"
+                          else None),
         **sway,
     )
 
@@ -377,6 +420,7 @@ class SynthIn(BaseModel):
     cfg_scale_text: float | None = Field(None, ge=0, le=20)
     cfg_scale_caption: float | None = Field(None, ge=0, le=20)
     cfg_scale_speaker: float | None = Field(None, ge=0, le=20)
+    speaker_kv_scale: float | None = Field(None, gt=0, le=3)
     watermark: bool = True
 
 
@@ -420,8 +464,8 @@ def health():
     }
 
 
-@app.post("/synth")
-async def synth(body: SynthIn):
+async def _synthesize(body: SynthIn):
+    """(result, elapsed seconds, batch size) for a /synth or /tts request."""
     if body.model not in (None, MODEL):
         raise HTTPException(400, f"this server runs model {MODEL!r} only")
     if body.voice is not None:
@@ -438,14 +482,47 @@ async def synth(body: SynthIn):
                              ("speaker", body.cfg_scale_speaker)) if v is not None}
     t0 = time.perf_counter()
     try:
-        req = _request(body.text, ref, body.caption, seed, body.num_steps, cfg)
+        req = _request(body.text, ref, body.caption, seed, body.num_steps, cfg, body.speaker_kv_scale)
         result, waited, batch_size = await asyncio.wrap_future(_state["worker"].submit(req, body.watermark))
     except HTTPException:
         raise
     except Exception as exc:  # do not echo text
         log.warning("synth failed: %s", type(exc).__name__)
         raise HTTPException(500, f"synthesis failed ({type(exc).__name__})")
-    elapsed = time.perf_counter() - t0
+    return result, time.perf_counter() - t0, batch_size
+
+
+# /tts: the WAV the app plays as it is (mono, 16-bit PCM). 24 kHz like VOICEVOX: the app's lip-sync
+# analysis runs on the main thread and costs ~2x at 48 kHz, and the file is half the size
+OUTPUT_SR = int(os.environ.get("IRODORI_OUTPUT_SR", "24000"))
+
+
+def _wav_bytes(audio: torch.Tensor, sr: int) -> bytes:
+    import torchaudio.functional as AF
+
+    x = audio.detach().float().reshape(1, -1).cpu()
+    if OUTPUT_SR and sr != OUTPUT_SR:
+        x = AF.resample(x, sr, OUTPUT_SR)
+        sr = OUTPUT_SR
+    pcm = (np.clip(x.reshape(-1).numpy(), -1.0, 1.0) * 32767.0).astype("<i2")
+    buf = io.BytesIO()
+    sf.write(buf, pcm, sr, subtype="PCM_16", format="WAV")
+    return buf.getvalue()
+
+
+@app.post("/tts")
+async def tts(body: SynthIn):
+    """One sentence -> audio/wav (IRODORI_OUTPUT_SR, mono, PCM 16). Send the sentences of a reply
+    concurrently: requests that arrive together are synthesized as one batch."""
+    result, elapsed, batch_size = await _synthesize(body)
+    wav = await asyncio.to_thread(_wav_bytes, result.audio, int(result.sample_rate))
+    return Response(wav, media_type="audio/wav", headers={
+        "X-Synth-Seconds": f"{elapsed:.4f}", "X-Batch-Size": str(batch_size)})
+
+
+@app.post("/synth")
+async def synth(body: SynthIn):
+    result, elapsed, batch_size = await _synthesize(body)
     audio = result.audio.detach().float().reshape(-1).numpy()
     pcm = (np.clip(audio, -1.0, 1.0) * 32767.0).astype("<i2").tobytes()
     return JSONResponse({

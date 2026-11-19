@@ -45,6 +45,7 @@ from .inference_runtime import (
     find_flattening_point,
 )
 from .meanflow import sample_euler_meanflow
+from .speaker_inversion import load_speaker_inversion_payload, speaker_inversion_batch_tensors
 from .codec import unpatchify_latent
 from .model import patch_sequence_with_mask
 from .rf import draw_initial_noise, sample_euler_rf_cfg
@@ -217,9 +218,9 @@ class TuringBatcher:
         return (
             req.lora_adapter is None
             and int(req.num_candidates or 1) == 1
-            and req.ref_embed is None
             and not req.no_ref
-            and (req.ref_wav is not None or bool(req.ref_wavs)
+            # a Speaker Inversion embedding (.speaker.safetensors) is a speaker state as it is
+            and (req.ref_embed is not None or req.ref_wav is not None or bool(req.ref_wavs)
                  or req.ref_latent is not None or bool(req.ref_latents))
             and str(req.speaker_uncond_mode).strip().lower() == "mask"
             and rt.model_cfg.use_speaker_condition_resolved
@@ -237,6 +238,22 @@ class TuringBatcher:
     def _speaker_state(self, req: SamplingRequest, messages: list[str]):
         """(1, S, D) speaker state and (1, S) mask of the request's reference, cached."""
         rt = self.rt
+        if req.ref_embed is not None:
+            # Speaker Inversion: the learned tokens replace the speaker encoder's output (upstream
+            # passes them as speaker_state_override without speaker_norm or the mean token, see
+            # InferenceRuntime._load_speaker_embedding_condition)
+            key = ("embed", str(req.ref_embed), rt.model.dtype)
+            hit = self._speaker_cache.get(key)
+            if hit is None:
+                emb = load_speaker_inversion_payload(req.ref_embed)["speaker_embedding"]
+                hit = speaker_inversion_batch_tensors(emb, batch_size=1, device=rt.model_device,
+                                                      dtype=rt.model.dtype)
+                self._speaker_cache[key] = hit
+                if len(self._speaker_cache) > _SPEAKER_CACHE_SIZE:
+                    self._speaker_cache.popitem(last=False)
+            else:
+                self._speaker_cache.move_to_end(key)
+            return hit
         max_ref_seconds = (
             rt.default_max_ref_seconds if req.max_ref_seconds is None else float(req.max_ref_seconds)
         )
