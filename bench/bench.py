@@ -66,7 +66,9 @@ def make_req(text: str, seed: int, args) -> SamplingRequest:
     if getattr(args, "sway", None) is not None:
         extra["t_schedule_mode"] = "sway"
         extra["sway_coeff"] = args.sway
-    return SamplingRequest(text=text, ref_wav=str(ROOT / "bench" / "ref30.wav"),
+    ref = ({"ref_latent": args.ref_latent} if getattr(args, "ref_latent", None)
+           else {"ref_wav": str(ROOT / "bench" / "ref30.wav")})
+    return SamplingRequest(text=text, **ref,
                            seed=seed + 7919 * getattr(args, "seed_round", 0),
                            num_steps=args.steps, **extra)
 
@@ -158,6 +160,7 @@ def main() -> None:
     ap.add_argument("--watermark-fp16", action="store_true")
     ap.add_argument("--fast", action="store_true", help="use irodori_tts.turing.TuringBatcher")
     ap.add_argument("--latent-multiple", type=int, default=1)
+    ap.add_argument("--ref-latent", help="reference latent (.pt, bench/make_latent.py) instead of ref30.wav: no codec encode")
     args = ap.parse_args()
     args.lc_info = []
 

@@ -21,6 +21,13 @@ env: IRODORI_MODEL=small|small-mf  IRODORI_PORT=8097  IRODORI_HOST=127.0.0.1
      request; the first one also warms up the server). <name>.pt is a reference latent made by
      bench/make_latent.py: the server then never runs the codec encoder (no VRAM peak for it)
      IRODORI_ALLOW_REF_AUDIO=0: refuse "ref_audio" uploads (registered voices only)
+     IRODORI_ROW_STREAM=0: answer a batch's requests together (default: each as soon as it is decoded)
+     IRODORI_GRAPH_FREEZE=0: keep capturing graphs / growing their slots after warm-up
+     IRODORI_COMPILE_FREEZE=0: allow torch.compile recompiles after warm-up
+     IRODORI_WARMUP_ROUNDS=2: passes over batch sizes MAX_BATCH..1 with varied sentences at warm-up
+     IRODORI_SDPA_CUDNN=1: allow cuDNN attention (default off here: a plan per new length, see below)
+     IRODORI_CUDA_MEMORY_MB=<n>: cap PyTorch's allocator (sharing a GPU; the CUDA context is extra)
+     IRODORI_WARMUP_LONG_TEXT: the longest text of the warm-up; it sizes the graphs (see _warmup)
 
 Privacy: request text / caption are never logged or written to disk; reference audio is written
 once (named by its sha256) to a private tmpfs dir for the runtime's latent cache and removed at
@@ -68,6 +75,12 @@ from irodori_tts.turing import TuringBatcher  # noqa: E402
 
 log = logging.getLogger("turing_server")
 
+# cuDNN's attention builds an execution plan for every new shape: on sm80+ (it is not used on Turing)
+# the first request of each new length paid ~0.7 s (RTX 2000 Ada, MF; the same call again 0.1 s).
+# Without it SDPA falls back to flash / memory-efficient attention at the same speed. Set
+# IRODORI_SDPA_CUDNN=1 to keep cuDNN.
+os.environ.setdefault("IRODORI_SDPA_CUDNN", "0")
+
 MODELS = {"small": "Aratako/Irodori-TTS-v4.1-Small", "small-mf": "Aratako/Irodori-TTS-v4.1-Small-MF"}
 MODEL = os.environ.get("IRODORI_MODEL", "small-mf")
 PRECISION = os.environ.get("IRODORI_PRECISION", "fp16")
@@ -83,6 +96,21 @@ MAX_TEXT_CHARS = 300
 # IRODORI_ALLOW_REF_AUDIO=0: refuse uploaded references (encoding one is a transient VRAM peak of
 # ~1.4GB for 30-120 s of audio, too much next to another tenant on the same GPU)
 ALLOW_REF_AUDIO = FLAG("IRODORI_ALLOW_REF_AUDIO")
+# IRODORI_ROW_STREAM=1 (default): answer each request of a batch as soon as its row is decoded and
+# watermarked (shortest first) instead of when the whole batch is done
+ROW_STREAM = FLAG("IRODORI_ROW_STREAM")
+# sizes the graphs at warm-up (see _warmup); sentences longer than this run without CUDA graphs
+WARMUP_LONG_TEXT = os.environ.get("IRODORI_WARMUP_LONG_TEXT", (
+    "今日はね、朝から雨が降っていたから、駅まで歩くのがすごく大変だったんだけど、"
+    "帰りにはすっかり晴れて、きれいな夕焼けが見えたんだよ。あなたにも見せたかったな。"))
+WARMUP_TEXTS = [
+    "うん。", "そうなんだ！", "えへへ、ありがと。", "おはよう、よく眠れた？", "またね！",
+    "ちょっと待って、今考えてるから。", "それ、すごく面白そうだね！私もやってみたいな。",
+    "ねえ、聞いてくれる？今日ね、すごく嬉しいことがあったんだ。",
+    "えっと、それってどういう意味なのかな？もう少し詳しく教えてほしいな。",
+    "ごめんね、昨日は返事できなくて。ちょっとバタバタしてて、気づいたら寝ちゃってたの。",
+    "雨の日って、なんだか落ち着くよね。窓の外を眺めながら、あったかいココアを飲むのが好きなんだ。",
+]
 
 
 def _voice_files() -> dict[str, Path]:
@@ -157,11 +185,18 @@ class BatchWorker:
     def _loop(self) -> None:
         while True:
             batch = self._gather()
+            def on_row(i, res, batch=batch):  # answer each row as soon as it is decoded
+                job = batch[i]
+                if not job.future.done():
+                    job.future.set_result((res, time.perf_counter() - job.enqueued, len(batch)))
+
             try:
-                results = self.run([j.req for j in batch], watermark=batch[0].watermark)
+                results = self.run([j.req for j in batch], watermark=batch[0].watermark,
+                                   on_row=on_row if ROW_STREAM else None)
                 now = time.perf_counter()
                 for job, res in zip(batch, results, strict=True):
-                    job.future.set_result((res, now - job.enqueued, len(batch)))
+                    if not job.future.done():
+                        job.future.set_result((res, now - job.enqueued, len(batch)))
             except Exception as exc:  # noqa: BLE001
                 log.warning("batch failed: %s", type(exc).__name__)
                 for job in batch:
@@ -169,14 +204,14 @@ class BatchWorker:
                         job.future.set_exception(exc)
             self.batches += 1
 
-    def run(self, reqs: list[SamplingRequest], *, watermark: bool = True):
+    def run(self, reqs: list[SamplingRequest], *, watermark: bool = True, on_row=None):
         rt = self.rt
         saved = rt.watermarker
         if not watermark:
             rt.watermarker = _NoWatermark()
         try:
             if all(self.batcher.supports(r) for r in reqs):
-                return self.batcher.synthesize_batch(reqs, length_check=LENGTH_CHECK)
+                return self.batcher.synthesize_batch(reqs, length_check=LENGTH_CHECK, on_row=on_row)
             # outside the fast path (e.g. no reference): upstream, one by one
             out = []
             for r in reqs:
@@ -191,16 +226,31 @@ class BatchWorker:
 
 def _warmup(worker: BatchWorker, ref_wav: str | None) -> None:
     """Capture graphs / compile for batch sizes 1..MAX_BATCH with short and long texts."""
-    texts = ["えっと、それってどういう意味なのかな？もう少し詳しく教えてほしいな。",
-             "おはよう！今日もいい天気だね。", "うん。"]
+    # the longest first: the batch of MAX_BATCH rows with it sizes the graphs' input slots, which
+    # are frozen afterwards (longer calls then run without graphs instead of dropping them all)
+    texts = [WARMUP_LONG_TEXT] + WARMUP_TEXTS
     t0 = time.perf_counter()
     # largest first: the graphs' shared input buffers are sized once instead of growing (each
-    # growth drops the graphs captured so far)
-    for n in range(MAX_BATCH, 0, -1):
-        reqs = [_request(texts[i % len(texts)], ref_wav, None, i, None, {}) for i in range(n)]
-        worker.run(reqs, watermark=True)
+    # growth drops the graphs captured so far). Then every batch size with sentences of varied
+    # lengths, IRODORI_WARMUP_ROUNDS times, so that the shapes a chat produces are captured /
+    # compiled here and not in front of a user (after warm-up neither happens any more, see below)
+    rounds = int(os.environ.get("IRODORI_WARMUP_ROUNDS", "2"))
+    worker.run([_request(WARMUP_LONG_TEXT, ref_wav, None, i, None, {}) for i in range(MAX_BATCH)], watermark=True)
+    k = 0
+    for _ in range(rounds):
+        for n in range(MAX_BATCH, 0, -1):
+            reqs = [_request(texts[(k + i) % len(texts)], ref_wav, None, k + i, None, {}) for i in range(n)]
+            worker.run(reqs, watermark=True)
+            k += n
+    graphs = worker.batcher.graphs
+    if graphs is not None and FLAG("IRODORI_GRAPH_FREEZE"):
+        graphs.freeze()
+    if FLAG("IRODORI_COMPILE_FREEZE") and FLAG("IRODORI_COMPILE"):
+        # a shape that would need a recompile runs that compiled region eagerly instead (a
+        # recompile is seconds of latency for the request that hits it)
+        torch.compiler.set_stance("eager_on_recompile")
     log.warning("warm-up %.1fs (%d graphs)", time.perf_counter() - t0,
-                len(worker.batcher.graphs.graphs) if worker.batcher.graphs else 0)
+                len(graphs.graphs) if graphs else 0)
 
 
 def _request(text, ref_wav, caption, seed, num_steps, cfg) -> SamplingRequest:
@@ -237,6 +287,13 @@ async def lifespan(app: FastAPI):
     shutil.rmtree(_ref_dir, ignore_errors=True)
     _ref_dir.mkdir(mode=0o700)
     t0 = time.perf_counter()
+    limit_mb = int(os.environ.get("IRODORI_CUDA_MEMORY_MB", "0"))
+    if limit_mb > 0:
+        # a hard ceiling for PyTorch's caching allocator: at the limit it frees its cache and
+        # retries before failing, so the process stops growing instead of taking another tenant's
+        # VRAM (the CUDA context, ~0.3-0.5 GB, is outside this limit)
+        total = torch.cuda.get_device_properties(0).total_memory
+        torch.cuda.set_per_process_memory_fraction(min(1.0, limit_mb * 2**20 / total))
     rt = InferenceRuntime.from_key(RuntimeKey(
         checkpoint=download_hf_checkpoint(MODELS[MODEL]), model_device="cuda",
         model_precision=PRECISION, codec_device="cuda", codec_precision="fp32",
@@ -322,6 +379,9 @@ def health():
         "max_batch": MAX_BATCH,
         "batch_window_ms": WINDOW * 1000.0,
         "batches": _state["worker"].batches if "worker" in _state else 0,
+        "graphs": ({"kept": len(g.graphs), "captures": g.captures, "replays": g.replays,
+                    "eager_calls": g.eager_calls, "frozen": g.frozen}
+                   if (g := getattr(_state.get("batcher"), "graphs", None)) is not None else None),
         "voices": sorted(_voice_files()),
     }
 

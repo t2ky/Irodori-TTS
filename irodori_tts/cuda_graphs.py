@@ -12,6 +12,11 @@ whatever the text length. Replaying a captured graph removes the per-kernel CPU 
   (the context K/V and conditions stay the same for all steps of a synthesis, so only ``x_t`` / ``t``
   are copied per step).
 * All graphs share one memory pool; they never run concurrently.
+* ``freeze()`` (after warm-up): the slots no longer grow and no new graph is captured. A call that
+  does not fit the slots or has a shape not seen during warm-up runs eagerly. Growing the slots
+  drops every captured graph (a server seeing one long sentence then paid a capture again for every
+  shape), and a capture costs a request several eager calls (on RTX 2000 Ada the graphs save ~10%
+  of a call, a capture costs ~0.5 s of tail latency).
 * Forward hooks (length_check's pointer recorder) only run while a graph is captured, so the eager
   forward is used whenever the first block's attention has hooks.
 
@@ -57,8 +62,24 @@ class GraphedDiT:
         self.pool = torch.cuda.graph_pool_handle()
         self.captures = 0
         self.replays = 0
+        self.eager_calls = 0
+        self.frozen = False
         # The RoPE table is cached on first use; grow it now so no capture allocates it.
         model._rope_freqs(8192, model.device)
+
+    def freeze(self) -> None:
+        """Keep the slots and the captured graphs as they are; other calls run eagerly."""
+        self.frozen = True
+
+    def _fits(self, leaves) -> bool:
+        for name, tensor in leaves:
+            if tensor is None:
+                continue
+            slot = self.slots.get(name)
+            if (slot is None or slot.buf is None or slot.buf.numel() < tensor.numel()
+                    or slot.buf.dtype != tensor.dtype or slot.buf.device != tensor.device):
+                return False
+        return True
 
     # -------------------------------------------------------------- helpers
     def _hooked(self) -> bool:
@@ -129,9 +150,16 @@ class GraphedDiT:
         x_t = kwargs["x_t"]
         if (x_t.device.type != "cuda" or self._hooked() or torch.cuda.is_current_stream_capturing()
                 or (self.max_rows is not None and x_t.shape[0] > self.max_rows)):
+            self.eager_calls += 1
             return self.eager(**kwargs)
         leaves = self._flatten(kwargs)
+        if self.frozen and not self._fits(leaves):
+            self.eager_calls += 1
+            return self.eager(**kwargs)
         key = tuple((n, None) if t is None else (n, tuple(t.shape), t.dtype) for n, t in leaves)
+        if self.frozen and key not in self.graphs:
+            self.eager_calls += 1
+            return self.eager(**kwargs)
         if self._ensure_slots(leaves):
             # buffers moved: graphs captured against the old addresses are invalid. A pool whose
             # graphs are all gone cannot be captured into again, so start a new one.

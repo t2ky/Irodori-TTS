@@ -439,7 +439,9 @@ class TuringBatcher:
         return plans, z, pointers
 
     # ---------------------------------------------------------------- decoding
-    def _finish(self, plans, z_rows, timings, post_load_t0):
+    def _finish(self, plans, z_rows, timings, post_load_t0, on_row=None):
+        if on_row is not None and self.decode_batch == 1:
+            return self._finish_rows(plans, z_rows, timings, post_load_t0, on_row)
         rt = self.rt
         device = rt.model_device
         # --- decode (row by row by default, see decode_batch)
@@ -488,6 +490,56 @@ class TuringBatcher:
             for p, a in zip(plans, audios, strict=True)
         ]
 
+    def _trimmed_samples(self, p, z_row) -> int:
+        max_samples = p.target_samples
+        if bool(p.req.trim_tail):
+            fp = find_flattening_point(
+                z_row[: p.latent_steps],
+                window_size=max(1, int(p.req.tail_window_size)),
+                std_threshold=float(p.req.tail_std_threshold),
+                mean_threshold=float(p.req.tail_mean_threshold),
+            )
+            hop = int(self.rt.codec.model.hop_length)
+            if fp * hop > 0:
+                max_samples = min(max_samples, fp * hop)
+        return max_samples
+
+    def _finish_rows(self, plans, z_rows, timings, post_load_t0, on_row):
+        """Like _finish, but each row is decoded, watermarked and handed to ``on_row(i, result)``
+        as soon as it is done, shortest first. On a slow GPU decoding + watermarking is most of the
+        batch (RTX 2000 Ada, 8 rows: 324 + 186 ms of 670), so a caller waiting for one row gets it
+        after its own decode instead of after the whole batch's."""
+        rt = self.rt
+        device = rt.model_device
+        sr = int(rt.codec.sample_rate)
+        amp = (torch.autocast("cuda", dtype=torch.float16)
+               if self.watermark_fp16 and rt.codec_device.type == "cuda" else contextlib.nullcontext())
+        dec_s = wm_s = 0.0
+        results: list[SamplingResult | None] = [None] * len(plans)
+        for i in sorted(range(len(plans)), key=lambda i: plans[i].latent_steps):
+            p = plans[i]
+            t0 = _measure_start(device, rt.codec_device)
+            audio = self._decode(z_rows[i][None, : p.latent_steps]).cpu()[0]
+            audio = audio[:, : self._trimmed_samples(p, z_rows[i])]
+            dec_s += _measure_end(device, t0, rt.codec_device)
+            if rt.watermarker.ready:
+                t0 = _measure_start(rt.codec_device)
+                with amp:
+                    audio = rt.watermarker.encode_batch([audio], sample_rate=sr)[0]
+                wm_s += _measure_end(rt.codec_device, t0)
+            stages = list(timings) + [("decode_latent", dec_s)] + (
+                [("silentcipher_watermark", wm_s)] if rt.watermarker.ready else [])
+            results[i] = SamplingResult(
+                audio=audio, audios=[audio], sample_rate=sr, stage_timings=stages,
+                total_to_decode=_measure_end(device, post_load_t0, rt.codec_device),
+                used_seed=p.used_seed, messages=p.messages,
+            )
+            on_row(i, results[i])
+        timings.append(("decode_latent", dec_s))
+        if rt.watermarker.ready:
+            timings.append(("silentcipher_watermark", wm_s))
+        return results
+
     # ---------------------------------------------------------------- main
     def synthesize_batch(
         self,
@@ -495,6 +547,7 @@ class TuringBatcher:
         *,
         log_fn: Callable[[str], None] | None = None,
         length_check: bool = False,
+        on_row: Callable[[int, SamplingResult], None] | None = None,
     ) -> list[SamplingResult]:
         """``length_check``: the two-pass length check of length_check.py, batched (RF v4.1 Small,
         independent CFG). Rows whose first pass is clearly longer than the reading are synthesized
@@ -534,7 +587,7 @@ class TuringBatcher:
             self.last_length_check = [{"length_check": "skipped"}] * len(plans)
             if check and pointers is not None:
                 self._length_check(requests, plans, z_rows, pointers, timings, _log)
-            results = self._finish(plans, z_rows, timings, post_load_t0)
+            results = self._finish(plans, z_rows, timings, post_load_t0, on_row=on_row)
         return results
 
     def _length_check(self, requests, plans, z_rows, pointers, timings, log) -> None:

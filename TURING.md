@@ -28,6 +28,12 @@
 | 8 | `watermark_fp16`: SilentCipher を fp16 の autocast で | 1 本 約 10ms が文ごとに直列。行をまとめても速くならない（スペクトログラムの畳み込みが律速、試して消した） | 8 本 226 → 72ms。読めたペイロードと確信度が fp32 と同じ |
 | 9 | `graph_max_rows`（既定 8 行）・`speaker_multiple`・`latent_multiple` | グラフは形ごとなので、参照音声の長さ・潜在の長さ・行数の組み合わせで数が増える。大きいバッチは計算律速でグラフの効果が 2〜4% しかない | — |
 | 10 | `turing_server.py`: 今のローカルサーバと同じ `/synth`・`/health` で、同時に来たリクエストを窓（既定 10ms・最大 8 本）でまとめる。声は `IRODORI_VOICES_DIR` に置いて名前（`voice`）で指定できる | 本番の形（1 プロセスに 1 版） | 下の負荷試験 |
+| 11 | 声を参照潜在（`<名前>.pt`、`bench/make_latent.py`）で登録できる。`IRODORI_ALLOW_REF_AUDIO=0` でアップロードを断る | 参照音声のエンコード（fp32 のコーデック）は 30〜120 秒で約 1.4GB の一時確保。別のプロセスと GPU を分けるときにこれが入らない（vLLM と同居する GPU で cuBLAS の確保に失敗した） | wav で渡したときと長さ一致・波形の差 0〜0.0015 |
+| 12 | 話者状態のキャッシュのキーに参照潜在のパスも入れる | 入れないと潜在だけのリクエストが全部同じキーになり、最初の声が使われる | キャッシュが声ごとに分かれる |
+| 13 | 済んだ文から順に返す（`on_row`、`IRODORI_ROW_STREAM`）。短い文から復号・透かし | 遅い GPU では復号と透かしがバッチの大半（RTX 2000 Ada、8 本で 670ms のうち 510ms） | 同時 8 本の平均 0.70 → 0.42 秒（最大は同じ） |
+| 14 | ウォームアップ後にグラフを凍結（`freeze()`、`IRODORI_GRAPH_FREEZE`）: 入力の置き場を広げず、新しい形は捕獲しない。compile も `eager_on_recompile`（`IRODORI_COMPILE_FREEZE`）。ウォームアップは行数 8〜1 × 長さのばらついた文 | 置き場を広げると捕獲済みのグラフが全部捨てられ（最長 34 字のウォームアップの後に長い文が 1 本来るだけで起きた）、捕獲 1 回は 0.5 秒前後の待ちになる | 下の Ada の節 |
+| 15 | サーバの既定で cuDNN の attention を切る（`IRODORI_SDPA_CUDNN=0`、上流の docs/parameters.md の推奨） | sm80 以上では cuDNN が選ばれ、**新しい長さのたびに実行計画を作る**。1 回目だけ +0.7 秒（Turing では使われないので 2080Ti では出ない） | 6 字 0.81 → 0.15 秒、46 字 0.95 → 0.27 秒。2 回目の速さは同じ |
+| 16 | `IRODORI_CUDA_MEMORY_MB`: PyTorch の確保の上限（`set_per_process_memory_fraction`）。`PYTORCH_ALLOC_CONF=expandable_segments:True` と組む | 長さがばらつくとキャッシュが伸び続ける（グラフなしで 5.3GB まで）。同居する vLLM の再起動には空きが要る | 4096 で起動後 3.5GB・負荷中の最大 4.1GB（プロセス全体）、速さは同じ、OOM なし |
 
 ## 計測（ps00 の 3090、`bench/bench.py`、参照 34 秒、チャットの 8 文、透かしなし）
 
@@ -86,3 +92,37 @@ python3 bench/load.py --voice <name> burst --n 8 --rounds 10
 - compile 済みのブロックは attention を取り込むので、あとから attention に付けたフックが呼ばれない
 - CUDA グラフの入力の置き場を広げると捕獲済みのグラフは無効になり、空になったプールにはもう捕獲できない（新しいプールを作る）。温めは大きい形から
 - 透かしを入れていない音声でも SilentCipher の検出が「あり」になることがある（2/8）。短い音声では fp32 でも 1 バイト目の読み違い・検出漏れがある。上流の性質
+
+## Ada（RTX 2000 Ada、16GB・70W・224GB/s、CPU は i7-7700）
+
+この GPU には vLLM（8B、`--gpu-memory-utilization=0.625`）が同居する。vLLM は起動時に 10.2GB の空きを要求するので、
+**TTS はプロセス全体で 6.1GB を超えてはいけない**。GPU を要求できない（`nvidia.com/gpu` は vLLM が取っている）ので、
+GPU を要求せずに nvidia ランタイムで同じ GPU を使う。
+
+推奨: MF・fp16・`IRODORI_GRAPHS=0`・compile あり・`IRODORI_SDPA_CUDNN=0`・`IRODORI_CUDA_MEMORY_MB=4096`・
+`PYTORCH_ALLOC_CONF=expandable_segments:True`・声は参照潜在・`IRODORI_ALLOW_REF_AUDIO=0`。
+
+- グラフはこの GPU ではほぼ効かない（1 本 0.114 → 0.116 秒）。形の組み合わせ（行数 × 潜在の長さ × トークン数）が多く、捕獲しても当たらない。切ると VRAM が減る
+- 復号（DACVAE）は 4 秒ぶん 36ms（compile あり）で、畳み込みの計算で律速。cudnn.benchmark は効かない
+- bf16 は fp16 と同じ速さの見込み（試していない）。fp16 で NaN が出ないのでそのまま
+
+返答まるごと（`bench/load.py replies`、`bench/replies.json` の 12 返答＝平均 2.7 文・音声 8.8 秒、文を同時に送り最後の文が返るまで。透かし・ウォームアップ済み）:
+
+| | 平均 | p95 | 最大 |
+|---|---|---|---|
+| MF・返答 1 件ずつ | 0.25〜0.30 | 0.31〜0.36 | 0.37 |
+| MF・同時 4 件 | 0.61〜0.63 | 0.94〜0.96 | 0.97 |
+| MF・文を毎秒 3 本（`texts_long.json`、最大 131 字） | 0.34 | 0.68 | 0.93 |
+| Small 40 ステップ・1 件 / 4 件 | 1.54 / 4.03 | 1.95 / 6.03 | 1.95 / 6.12 |
+| Small 16 ステップ・sway −1・1 件 / 4 件 | 0.82 / 2.22 | 1.08 / 3.16 | 1.08 / 3.24 |
+
+**vLLM と同時に負荷がかかると時分割で互いに遅くなる**（MPS なし）: vLLM の 1 トークン 24 → 33ms（TTS に毎秒 3 本）、
+TTS の返答 1 件 0.26 → 0.97 秒・同時 4 件 0.62 → 2.85 秒（vLLM に同時 4 本を流し続けたとき）。TTS が待っているだけなら vLLM は遅くならない。
+
+```bash
+IRODORI_MODEL=small-mf IRODORI_VOICES_DIR=<dir> IRODORI_GRAPHS=0 IRODORI_CUDA_MEMORY_MB=4096 \
+  PYTORCH_ALLOC_CONF=expandable_segments:True IRODORI_ALLOW_REF_AUDIO=0 python turing_server.py
+python3 bench/load.py --url http://127.0.0.1:8097 --voice <name> replies --replies bench/replies.json --concurrent 4
+```
+
+- torch 2.10 の inductor のキャッシュは別のプロセスから読めない（`DefaultsSource.__init__()` の TypeError）。起動のたびにコンパイルし直す（起動 11 秒＋ウォームアップ 30 秒）

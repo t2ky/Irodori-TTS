@@ -19,7 +19,7 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 TEXTS = json.loads((HERE / "texts.json").read_text())
-REF = base64.b64encode((HERE / "ref30.wav").read_bytes()).decode()
+REF = base64.b64encode((HERE / "ref30.wav").read_bytes()).decode() if (HERE / "ref30.wav").exists() else None
 
 
 VOICE = None
@@ -46,12 +46,20 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--url", default="http://127.0.0.1:8099")
     ap.add_argument("--voice", help="name of a voice registered on the server instead of uploading ref30.wav")
+    ap.add_argument("--texts", help="JSON list of texts instead of bench/texts.json")
     sub = ap.add_subparsers(dest="mode", required=True)
     b = sub.add_parser("burst"); b.add_argument("--n", type=int, default=8); b.add_argument("--rounds", type=int, default=10)
     p = sub.add_parser("poisson"); p.add_argument("--rate", type=float, default=6.0); p.add_argument("--seconds", type=float, default=60)
+    r = sub.add_parser("replies", help="whole replies: each is split into sentences sent at once; "
+                       "the time is until its last sentence is back (what the app waits for)")
+    r.add_argument("--replies", required=True, help="JSON list of reply texts")
+    r.add_argument("--concurrent", type=int, default=1, help="replies at the same time")
+    r.add_argument("--rounds", type=int, default=10)
     a = ap.parse_args()
-    global VOICE
+    global VOICE, TEXTS
     VOICE = a.voice
+    if a.texts:
+        TEXTS = json.loads(Path(a.texts).read_text())
     call(a.url, TEXTS[1], 0)  # wake up
     rows, lock = [], threading.Lock()
 
@@ -60,6 +68,36 @@ def main():
         with lock:
             rows.append(r)
 
+    if a.mode == "replies":
+        import re
+        replies = json.loads(Path(a.replies).read_text())
+
+        def split(text):
+            return [x for x in re.findall(r"[^。！？!?]+[。！？!?]*", text) if x.strip()]
+
+        def reply(text, seed):
+            parts = split(text)
+            done = []
+            th = [threading.Thread(target=lambda t=t, k=k: done.append(call(a.url, t, seed + k)))
+                  for k, t in enumerate(parts)]
+            t0 = time.perf_counter()
+            for t in th:
+                t.start()
+            for t in th:
+                t.join()
+            with lock:
+                rows.append((time.perf_counter() - t0, max(d[1] for d in done), sum(d[2] for d in done), len(parts)))
+
+        for k in range(a.rounds):
+            ts = [threading.Thread(target=reply, args=(replies[(k * a.concurrent + i) % len(replies)], 1000 * k + 50 * i))
+                  for i in range(a.concurrent)]
+            for t in ts:
+                t.start()
+            for t in ts:
+                t.join()
+        report(f"replies x{a.concurrent}", rows)
+        print(f"  文の数 平均 {statistics.mean(r[3] for r in rows):.1f} / 音声 平均 {statistics.mean(r[2] for r in rows):.1f} 秒")
+        return
     if a.mode == "burst":
         for k in range(a.rounds):
             ts = [threading.Thread(target=one, args=(TEXTS[(i + k) % len(TEXTS)], 100 * k + i)) for i in range(a.n)]
