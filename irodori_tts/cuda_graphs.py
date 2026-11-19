@@ -38,6 +38,18 @@ _ARG_ORDER = (
 )
 
 
+_SIDE_STREAM: torch.cuda.Stream | None = None
+
+
+def _side_stream() -> torch.cuda.Stream:
+    """One side stream for every capture's warm-up runs. cuBLAS keeps a workspace per stream, so a
+    new stream per capture leaked one each (48 text-encoder graphs held ~290 MB, ~6 MB a capture)."""
+    global _SIDE_STREAM
+    if _SIDE_STREAM is None:
+        _SIDE_STREAM = torch.cuda.Stream()
+    return _SIDE_STREAM
+
+
 class _Slot:
     """A flat device buffer shared by all graphs for one argument position."""
 
@@ -181,7 +193,7 @@ class GraphedDiT:
 
     def _capture(self, kwargs, leaves):
         static = self._static_kwargs(kwargs, leaves)
-        stream = torch.cuda.Stream()
+        stream = _side_stream()
         stream.wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(stream):
             for _ in range(2):  # warm-up: lazy inits, cuBLAS handles, SDPA backend choice
@@ -246,7 +258,7 @@ class GraphedCall:
         sargs = list(args)
         for (i, _), s in zip(tensors, static_in):
             sargs[i] = s
-        stream = torch.cuda.Stream()
+        stream = _side_stream()
         stream.wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(stream):
             for _ in range(2):

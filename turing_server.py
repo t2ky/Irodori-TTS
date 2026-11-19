@@ -27,7 +27,8 @@ env: IRODORI_MODEL=small|small-mf  IRODORI_PORT=8097  IRODORI_HOST=127.0.0.1
      IRODORI_WARMUP_ROUNDS=2: passes over batch sizes MAX_BATCH..1 with varied sentences at warm-up
      IRODORI_SDPA_CUDNN=1: allow cuDNN attention (default off here: a plan per new length, see below)
      IRODORI_CUDA_MEMORY_MB=<n>: cap PyTorch's allocator (sharing a GPU; the CUDA context is extra)
-     IRODORI_GRAPH_ENCODER=0: no CUDA graphs for the text encoder (default: all shapes captured at warm-up)
+     IRODORI_GRAPH_ENCODER=0: no CUDA graphs for the text encoder (default: shapes up to
+     IRODORI_ENCODER_GRAPH_TOKENS=96 tokens captured at warm-up; longer sentences run eagerly)
      IRODORI_FAST_WATERMARK=0: the packaged SilentCipher encode (default: same output, no host round trips)
      IRODORI_WARMUP_LONG_TEXT: the longest text of the warm-up; it sizes the graphs (see _warmup)
 
@@ -193,8 +194,15 @@ class BatchWorker:
                     job.future.set_result((res, time.perf_counter() - job.enqueued, len(batch)))
 
             try:
-                results = self.run([j.req for j in batch], watermark=batch[0].watermark,
-                                   on_row=on_row if ROW_STREAM else None)
+                try:
+                    results = self.run([j.req for j in batch], watermark=batch[0].watermark,
+                                       on_row=on_row if ROW_STREAM else None)
+                except torch.OutOfMemoryError:
+                    # under IRODORI_CUDA_MEMORY_MB: give the cache back and try once more
+                    log.warning("batch hit the memory limit; retrying after emptying the cache")
+                    torch.cuda.empty_cache()
+                    results = self.run([j.req for j in batch], watermark=batch[0].watermark,
+                                       on_row=on_row if ROW_STREAM else None)
                 now = time.perf_counter()
                 for job, res in zip(batch, results, strict=True):
                     if not job.future.done():
@@ -245,7 +253,10 @@ def _warmup(worker: BatchWorker, ref_wav: str | None) -> None:
             worker.run(reqs, watermark=True)
             k += n
     t1 = time.perf_counter()
-    n_enc = worker.batcher.warm_encoder(MAX_BATCH)
+    # tokens are ~2 characters each: 96 covers sentences up to ~190 characters; longer ones run the
+    # encoder eagerly. Every captured shape keeps its output in the graph pool, which the allocator
+    # cannot give back (all 256 lengths took ~370 MB and ran a long reply into the memory cap)
+    n_enc = worker.batcher.warm_encoder(MAX_BATCH, int(os.environ.get("IRODORI_ENCODER_GRAPH_TOKENS", "96")))
     if n_enc:
         log.warning("text encoder graphs: %d in %.1fs", n_enc, time.perf_counter() - t1)
     graphs = worker.batcher.graphs
