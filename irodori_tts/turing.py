@@ -20,10 +20,12 @@ noise speaker-uncond mode) fall back to ``runtime.synthesize_batch``.
 """
 from __future__ import annotations
 
+import collections
 import contextlib
 import copy
 import dataclasses
 import math
+import time
 import secrets
 from collections import OrderedDict
 from collections.abc import Callable, Sequence
@@ -132,8 +134,15 @@ class TuringBatcher:
         compile_decoder: bool = False,
         compile_blocks: bool = False,
         watermark_fp16: bool = False,
+        graph_encoder: bool = False,
+        fast_watermark: bool = False,
+        sync_timings: bool = True,
     ) -> None:
         self.rt = runtime
+        # sync_timings=False: stage timings without waiting for the GPU (they then measure the CPU's
+        # launching, not the GPU). Every stage boundary was a device sync that kept the CPU from
+        # queueing the next stage while the GPU worked; a server does not need per-stage times.
+        self.sync_timings = bool(sync_timings)
         self.pad_multiple = int(pad_multiple)
         # Round the batch's latent length up (masked frames) so DiT shapes repeat; 1 = exact.
         self.latent_multiple = int(latent_multiple)
@@ -157,11 +166,29 @@ class TuringBatcher:
         # with the same decoded payloads and confidences as fp32. Batching the rows (padded) gives
         # nothing: the spectrogram convolutions are compute-bound.
         self.watermark_fp16 = bool(watermark_fp16)
+        # fast_watermark: fast_watermark.FastSilentCipher (same output, no host round trips; the
+        # decoded row stays on the GPU). Used only while rt.watermarker is the one given here.
+        self._fast_wm = None
+        self._fast_wm_owner = None
+        if fast_watermark and runtime.watermarker.ready:
+            from .fast_watermark import FastSilentCipher
+
+            fw = FastSilentCipher(runtime.watermarker.model, int(runtime.codec.sample_rate))
+            if fw.supported:
+                self._fast_wm, self._fast_wm_owner = fw, runtime.watermarker
         self.graphs = None
         if cuda_graphs:
             from .cuda_graphs import GraphedDiT
 
             self.graphs = GraphedDiT(runtime.model, max_rows=graph_max_rows)
+        # The text encoder (ModernBERT, ~870 small kernels per call whatever the batch) under CUDA
+        # graphs, one per (rows, padded tokens): on a slow CPU it is launch-bound (Xeon E5-2695 v2:
+        # 46 ms for one row). Independent of ``cuda_graphs`` (the DiT's). See warm_encoder.
+        self.encoder_graphs = None
+        if graph_encoder:
+            from .cuda_graphs import GraphedCall
+
+            self.encoder_graphs = GraphedCall(runtime.model.text_encoder)
         # Pad the speaker state (masked) to a multiple of this many tokens so that references of
         # different lengths share DiT shapes (CUDA graphs are per shape). 1 = exact.
         self.speaker_multiple = max(1, int(speaker_multiple))
@@ -196,6 +223,13 @@ class TuringBatcher:
             and rt.model_cfg.use_speaker_condition_resolved
             and getattr(rt.model, "speaker_inversion", None) is None
         )
+
+    # ---------------------------------------------------------------- timing
+    def _mstart(self, device, *extra) -> float:
+        return _measure_start(device, *extra) if self.sync_timings else time.perf_counter()
+
+    def _mend(self, device, t0, *extra) -> float:
+        return _measure_end(device, t0, *extra) if self.sync_timings else time.perf_counter() - t0
 
     # ---------------------------------------------------------------- pieces
     def _speaker_state(self, req: SamplingRequest, messages: list[str]):
@@ -261,6 +295,42 @@ class TuringBatcher:
             model.caption_encoder = original
 
     @contextlib.contextmanager
+    def _graphed_text_encoder(self):
+        """Route model.text_encoder(...) through the encoder graphs (an instance attribute shadows
+        the registered submodule for attribute lookup only; the module itself is untouched)."""
+        model = self.rt.model
+        if self.encoder_graphs is None:
+            yield
+            return
+        model.__dict__["text_encoder"] = self.encoder_graphs
+        try:
+            yield
+        finally:
+            del model.__dict__["text_encoder"]
+
+    def warm_encoder(self, max_rows: int, max_tokens: int | None = None) -> int:
+        """Capture the text encoder for every (rows 1..max_rows, tokens multiple of pad_multiple up
+        to max_tokens) and freeze: no request pays a capture, none of these shapes runs eagerly."""
+        if self.encoder_graphs is None:
+            return 0
+        rt = self.rt
+        model = rt.model
+        max_tokens = int(max_tokens or rt.default_text_max_len)
+        device = rt.model_device
+        backbone = model.pretrained_text_backbone
+        with torch.inference_mode():
+            for n in range(max_rows, 0, -1):
+                for length in range(self.pad_multiple, max_tokens + 1, self.pad_multiple):
+                    ids = torch.ones((n, length), dtype=torch.long, device=device)
+                    mask = torch.ones((n, length), dtype=torch.bool, device=device)
+                    if backbone is None:
+                        self.encoder_graphs(ids, mask)
+                    else:
+                        self.encoder_graphs(backbone, ids, mask)
+        self.encoder_graphs.freeze()
+        return len(self.encoder_graphs.graphs)
+
+    @contextlib.contextmanager
     def _reuse_encoded(self, encoded, *, use_graphs: bool = True, recorder=None, last_call: int = 0):
         """Make the sampler's single encode_conditions call return the batch's encoded conditions,
         and route its DiT calls through the CUDA graphs when enabled. With ``recorder`` the
@@ -298,7 +368,7 @@ class TuringBatcher:
         device = rt.model_device
         _log = log
         # --- tokens
-        t0 = _measure_start(device)
+        t0 = self._mstart(device)
         rows = [
             rt.tokenizer.batch_encode([p.normalized_text], max_length=p.text_max_len) for p in plans
         ]
@@ -323,10 +393,10 @@ class TuringBatcher:
             caption_mask = _right_pad_cat([r[1] for r in cap_rows])
             caption_ids, caption_mask = _trim(caption_ids, caption_mask, self.pad_multiple)
             caption_ids, caption_mask = caption_ids.to(device), caption_mask.to(device)
-        timings.append(("tokenize_text", _measure_end(device, t0)))
+        timings.append(("tokenize_text", self._mend(device, t0)))
 
         # --- speaker
-        t0 = _measure_start(device)
+        t0 = self._mstart(device)
         spk = [self._speaker_state(p.req, p.messages) for p in plans]
         speaker_state = _right_pad_cat([s for s, _ in spk])
         speaker_mask = _right_pad_cat([m for _, m in spk])
@@ -334,12 +404,12 @@ class TuringBatcher:
         if extra:
             speaker_state = torch.nn.functional.pad(speaker_state, (0, 0, 0, extra))
             speaker_mask = torch.nn.functional.pad(speaker_mask, (0, extra))
-        timings.append(("prepare_reference", _measure_end(device, t0)))
+        timings.append(("prepare_reference", self._mend(device, t0)))
 
         # --- encode once
-        t0 = _measure_start(device)
+        t0 = self._mstart(device)
         caption_ctx = contextlib.nullcontext() if any_caption else self._zero_caption_encoder()
-        with caption_ctx:
+        with caption_ctx, self._graphed_text_encoder():
             encoded = model.encode_conditions(
                 text_input_ids=text_ids,
                 text_mask=text_mask,
@@ -351,12 +421,12 @@ class TuringBatcher:
                 speaker_mask_override=speaker_mask,
                 speaker_uncond_mode="mask",
             )
-        timings.append(("encode_conditions", _measure_end(device, t0)))
+        timings.append(("encode_conditions", self._mend(device, t0)))
 
         # --- duration
-        t0 = _measure_start(device)
+        t0 = self._mstart(device)
         self._plan_lengths(plans, encoded, text_ids, text_mask, speaker_mask, _log)
-        timings.append(("predict_duration", _measure_end(device, t0)))
+        timings.append(("predict_duration", self._mend(device, t0)))
 
         # --- sample
         seq_len = max(p.patched_steps for p in plans)
@@ -386,7 +456,7 @@ class TuringBatcher:
             # identical to upstream's single-request call (no mask)
             batch_kwargs = {"sequence_length": seq_len, "initial_noise": noise}
         first = plans[0]
-        t0 = _measure_start(device)
+        t0 = self._mstart(device)
         # speaker_kv_scale rescales the context K/V in place between steps: keep it eager
         use_graphs = first.speaker_kv_scale is None
         recorder = _BatchPointer(model, len(plans)) if record_pointer else None
@@ -425,7 +495,7 @@ class TuringBatcher:
                     **batch_kwargs,
                 )
         stage = "sample_meanflow" if rt.model_cfg.flow_parameterization == "meanflow" else "sample_rf"
-        timings.append((stage, _measure_end(device, t0)))
+        timings.append((stage, self._mend(device, t0)))
 
         z = unpatchify_latent(
             z_patched, patch_size=rt.model_cfg.latent_patch_size, latent_dim=rt.model_cfg.latent_dim
@@ -440,12 +510,12 @@ class TuringBatcher:
 
     # ---------------------------------------------------------------- decoding
     def _finish(self, plans, z_rows, timings, post_load_t0, on_row=None):
-        if on_row is not None and self.decode_batch == 1:
-            return self._finish_rows(plans, z_rows, timings, post_load_t0, on_row)
+        if self.decode_batch == 1 and (on_row is not None or self._fast_watermark_active()):
+            return self._finish_rows(plans, z_rows, timings, post_load_t0, on_row or (lambda i, r: None))
         rt = self.rt
         device = rt.model_device
         # --- decode (row by row by default, see decode_batch)
-        t0 = _measure_start(device, rt.codec_device)
+        t0 = self._mstart(device, rt.codec_device)
         hop = int(rt.codec.model.hop_length)
         order = sorted(range(len(plans)), key=lambda i: plans[i].latent_steps)
         decoded: dict[int, torch.Tensor] = {}
@@ -470,17 +540,17 @@ class TuringBatcher:
                 if fp * hop > 0:
                     max_samples = min(max_samples, fp * hop)
             audios.append(decoded[i][:, :max_samples])
-        timings.append(("decode_latent", _measure_end(device, t0, rt.codec_device)))
+        timings.append(("decode_latent", self._mend(device, t0, rt.codec_device)))
 
         if rt.watermarker.ready:
-            t0 = _measure_start(rt.codec_device)
+            t0 = self._mstart(rt.codec_device)
             amp = (torch.autocast("cuda", dtype=torch.float16)
                    if self.watermark_fp16 and rt.codec_device.type == "cuda" else contextlib.nullcontext())
             with amp:
                 audios = rt.watermarker.encode_batch(audios, sample_rate=int(rt.codec.sample_rate))
-            timings.append(("silentcipher_watermark", _measure_end(rt.codec_device, t0)))
+            timings.append(("silentcipher_watermark", self._mend(rt.codec_device, t0)))
 
-        total = _measure_end(device, post_load_t0, rt.codec_device)
+        total = self._mend(device, post_load_t0, rt.codec_device)
         return [
             SamplingResult(
                 audio=a, audios=[a], sample_rate=int(rt.codec.sample_rate),
@@ -504,7 +574,65 @@ class TuringBatcher:
                 max_samples = min(max_samples, fp * hop)
         return max_samples
 
+    def _fast_watermark_active(self) -> bool:
+        rt = self.rt
+        return (self._fast_wm is not None and rt.watermarker is self._fast_wm_owner
+                and rt.codec_device.type == "cuda")
+
     def _finish_rows(self, plans, z_rows, timings, post_load_t0, on_row):
+        if self._fast_watermark_active() or not self.rt.watermarker.ready:
+            return self._finish_rows_pipelined(plans, z_rows, timings, post_load_t0, on_row)
+        return self._finish_rows_serial(plans, z_rows, timings, post_load_t0, on_row)
+
+    def _finish_rows_pipelined(self, plans, z_rows, timings, post_load_t0, on_row):
+        """_finish_rows_serial without waiting between rows: each row is decoded, watermarked on the
+        GPU (fast_watermark) and copied to pinned host memory asynchronously, and the CPU goes on
+        queueing the next row; finished rows are handed to ``on_row`` in order (shortest first) as
+        their copies complete. The only host syncs are the trims (once, before decoding) and the
+        per-row copy events."""
+        rt = self.rt
+        device = rt.model_device
+        sr = int(rt.codec.sample_rate)
+        wm = self._fast_wm if rt.watermarker.ready else None
+        amp = (torch.autocast("cuda", dtype=torch.float16)
+               if self.watermark_fp16 and rt.codec_device.type == "cuda" else contextlib.nullcontext())
+        order = sorted(range(len(plans)), key=lambda i: plans[i].latent_steps)
+        trims = {i: self._trimmed_samples(plans[i], z_rows[i]) for i in order}
+        t0 = self._mstart(device, rt.codec_device)
+        results: list[SamplingResult | None] = [None] * len(plans)
+        pending: collections.deque = collections.deque()
+
+        def done(i, buf, ev):
+            ev.synchronize()
+            p = plans[i]
+            elapsed = time.perf_counter() - t0
+            results[i] = SamplingResult(
+                audio=buf, audios=[buf], sample_rate=sr,
+                stage_timings=list(timings) + [("decode_watermark", elapsed)],
+                total_to_decode=time.perf_counter() - post_load_t0,
+                used_seed=p.used_seed, messages=p.messages,
+            )
+            on_row(i, results[i])
+
+        for i in order:
+            p = plans[i]
+            audio = self._decode(z_rows[i][None, : p.latent_steps])[0][:, : trims[i]]
+            if wm is not None:
+                with amp:
+                    audio = wm.encode(audio).view(1, -1)
+            buf = torch.empty(audio.shape, dtype=torch.float32, pin_memory=True)
+            buf.copy_(audio, non_blocking=True)
+            ev = torch.cuda.Event()
+            ev.record()
+            pending.append((i, buf, ev))
+            while pending and pending[0][2].query():
+                done(*pending.popleft())
+        while pending:
+            done(*pending.popleft())
+        timings.append(("decode_watermark", self._mend(device, t0, rt.codec_device)))
+        return results
+
+    def _finish_rows_serial(self, plans, z_rows, timings, post_load_t0, on_row):
         """Like _finish, but each row is decoded, watermarked and handed to ``on_row(i, result)``
         as soon as it is done, shortest first. On a slow GPU decoding + watermarking is most of the
         batch (RTX 2000 Ada, 8 rows: 324 + 186 ms of 670), so a caller waiting for one row gets it
@@ -518,20 +646,20 @@ class TuringBatcher:
         results: list[SamplingResult | None] = [None] * len(plans)
         for i in sorted(range(len(plans)), key=lambda i: plans[i].latent_steps):
             p = plans[i]
-            t0 = _measure_start(device, rt.codec_device)
+            t0 = self._mstart(device, rt.codec_device)
             audio = self._decode(z_rows[i][None, : p.latent_steps]).cpu()[0]
             audio = audio[:, : self._trimmed_samples(p, z_rows[i])]
-            dec_s += _measure_end(device, t0, rt.codec_device)
+            dec_s += self._mend(device, t0, rt.codec_device)
             if rt.watermarker.ready:
-                t0 = _measure_start(rt.codec_device)
+                t0 = self._mstart(rt.codec_device)
                 with amp:
                     audio = rt.watermarker.encode_batch([audio], sample_rate=sr)[0]
-                wm_s += _measure_end(rt.codec_device, t0)
+                wm_s += self._mend(rt.codec_device, t0)
             stages = list(timings) + [("decode_latent", dec_s)] + (
                 [("silentcipher_watermark", wm_s)] if rt.watermarker.ready else [])
             results[i] = SamplingResult(
                 audio=audio, audios=[audio], sample_rate=sr, stage_timings=stages,
-                total_to_decode=_measure_end(device, post_load_t0, rt.codec_device),
+                total_to_decode=self._mend(device, post_load_t0, rt.codec_device),
                 used_seed=p.used_seed, messages=p.messages,
             )
             on_row(i, results[i])
@@ -580,7 +708,7 @@ class TuringBatcher:
                 for r in requests
             ]
         timings: list[tuple[str, float]] = []
-        post_load_t0 = _measure_start(rt.model_device, rt.codec_device)
+        post_load_t0 = self._mstart(rt.model_device, rt.codec_device)
         with rt._infer_lock, torch.inference_mode():
             plans, z, pointers = self._sample(requests, timings, _log, record_pointer=check)
             z_rows = [z[i] for i in range(len(plans))]
@@ -619,10 +747,10 @@ class TuringBatcher:
             if not redo:
                 break
             rows = sorted(redo)
-            t0 = _measure_start(rt.model_device)
+            t0 = self._mstart(rt.model_device)
             sub = [dataclasses.replace(requests[i], seconds=redo[i] / fps) for i in rows]
             sub_plans, sub_z, sub_ptr = self._sample(sub, [], log, record_pointer=True)
-            timings.append((f"length_check_pass{attempt + 2}", _measure_end(rt.model_device, t0)))
+            timings.append((f"length_check_pass{attempt + 2}", self._mend(rt.model_device, t0)))
             nxt: dict[int, int] = {}
             for k, i in enumerate(rows):
                 pointer, text_len = sub_ptr[k]

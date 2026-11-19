@@ -27,6 +27,8 @@ env: IRODORI_MODEL=small|small-mf  IRODORI_PORT=8097  IRODORI_HOST=127.0.0.1
      IRODORI_WARMUP_ROUNDS=2: passes over batch sizes MAX_BATCH..1 with varied sentences at warm-up
      IRODORI_SDPA_CUDNN=1: allow cuDNN attention (default off here: a plan per new length, see below)
      IRODORI_CUDA_MEMORY_MB=<n>: cap PyTorch's allocator (sharing a GPU; the CUDA context is extra)
+     IRODORI_GRAPH_ENCODER=0: no CUDA graphs for the text encoder (default: all shapes captured at warm-up)
+     IRODORI_FAST_WATERMARK=0: the packaged SilentCipher encode (default: same output, no host round trips)
      IRODORI_WARMUP_LONG_TEXT: the longest text of the warm-up; it sizes the graphs (see _warmup)
 
 Privacy: request text / caption are never logged or written to disk; reference audio is written
@@ -242,6 +244,10 @@ def _warmup(worker: BatchWorker, ref_wav: str | None) -> None:
             reqs = [_request(texts[(k + i) % len(texts)], ref_wav, None, k + i, None, {}) for i in range(n)]
             worker.run(reqs, watermark=True)
             k += n
+    t1 = time.perf_counter()
+    n_enc = worker.batcher.warm_encoder(MAX_BATCH)
+    if n_enc:
+        log.warning("text encoder graphs: %d in %.1fs", n_enc, time.perf_counter() - t1)
     graphs = worker.batcher.graphs
     if graphs is not None and FLAG("IRODORI_GRAPH_FREEZE"):
         graphs.freeze()
@@ -305,6 +311,9 @@ async def lifespan(app: FastAPI):
         latent_multiple=int(os.environ.get("IRODORI_LATENT_MULTIPLE", "16")),
         speaker_multiple=int(os.environ.get("IRODORI_SPEAKER_MULTIPLE", "64")),
         graph_max_rows=int(os.environ.get("IRODORI_GRAPH_MAX_ROWS", "8")),
+        graph_encoder=FLAG("IRODORI_GRAPH_ENCODER"),
+        fast_watermark=FLAG("IRODORI_FAST_WATERMARK"),
+        sync_timings=False,
     )
     _state.update(rt=rt, batcher=batcher)
     worker = BatchWorker(rt, batcher)

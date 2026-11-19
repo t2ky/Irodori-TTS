@@ -34,6 +34,9 @@
 | 14 | ウォームアップ後にグラフを凍結（`freeze()`、`IRODORI_GRAPH_FREEZE`）: 入力の置き場を広げず、新しい形は捕獲しない。compile も `eager_on_recompile`（`IRODORI_COMPILE_FREEZE`）。ウォームアップは行数 8〜1 × 長さのばらついた文 | 置き場を広げると捕獲済みのグラフが全部捨てられ（最長 34 字のウォームアップの後に長い文が 1 本来るだけで起きた）、捕獲 1 回は 0.5 秒前後の待ちになる | 下の Ada の節 |
 | 15 | サーバの既定で cuDNN の attention を切る（`IRODORI_SDPA_CUDNN=0`、上流の docs/parameters.md の推奨） | sm80 以上では cuDNN が選ばれ、**新しい長さのたびに実行計画を作る**。1 回目だけ +0.7 秒（Turing では使われないので 2080Ti では出ない） | 6 字 0.81 → 0.15 秒、46 字 0.95 → 0.27 秒。2 回目の速さは同じ |
 | 16 | `IRODORI_CUDA_MEMORY_MB`: PyTorch の確保の上限（`set_per_process_memory_fraction`）。`PYTORCH_ALLOC_CONF=expandable_segments:True` と組む | 長さがばらつくとキャッシュが伸び続ける（グラフなしで 5.3GB まで）。同居する vLLM の再起動には空きが要る | 4096 で起動後 3.5GB・負荷中の最大 4.1GB（プロセス全体）、速さは同じ、OOM なし |
+| 17 | `graph_encoder`（`IRODORI_GRAPH_ENCODER`）: テキストエンコーダ（ModernBERT）を `cuda_graphs.GraphedCall` で形ごとにグラフに。`warm_encoder` が行数 1〜8 × トークン 16 刻み〜256 の 128 個を起動時に捕まえて凍結する | 1 回に約 870 個の小さなカーネルで、行数によらず起動律速。遅い CPU では 1 行で 46ms（Xeon E5-2695 v2） | 出力は同じ（差 0.0）。3090 で 14.8 → 5.8ms、捕獲 9 秒 |
+| 18 | `fast_watermark`（`IRODORI_FAST_WATERMARK`、`fast_watermark.py`）: SilentCipher の encode_wav を同期なしで書き直し。リサンプルのフィルタ・窓・メッセージを使い回し、無音の判定は GPU 上、復号した音声を CPU に戻さず渡す | 元は 1 行の中で何度も CPU が GPU を待つ（3090 で 1 行 27ms のうち GPU 10ms）。窓は毎回 CPU から転送、フィルタは毎回作り直し、既定の SDR で毎回 print | 元と完全一致（fp32・fp16 とも差 0.0、ペイロードも同じ）。リサンプルのフィルタは `functional.resample` と同じ作り方にしないと 1e-4 ずれる（`transforms.Resample` は CPU で作る） |
+| 19 | 文ごとに返す処理の流れ作業化（`_finish_rows_pipelined`）: 行ごとに非同期で pinned メモリへ書き戻しを予約して次の行を投げ、書き戻しが済んだ行から返す。`sync_timings=False` で段の区切りの同期もやめる（サーバ） | 行ごと・段ごとに GPU の完了を待つと、その間 CPU が次を投げられない | 元の設定同士の揺れ（fp16、最大 0.00195）と同じ差 |
 
 ## 計測（ps00 の 3090、`bench/bench.py`、参照 34 秒、チャットの 8 文、透かしなし）
 

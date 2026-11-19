@@ -192,3 +192,68 @@ class GraphedDiT:
             out = self.eager(**static)
         self.captures += 1
         return graph, out
+
+
+class GraphedCall:
+    """CUDA graphs for a plain function of tensors (e.g. the text encoder), one per input signature.
+
+    Unlike GraphedDiT, each graph owns its static inputs (the inputs are small: token ids and masks)
+    and all graphs share one memory pool. Non-tensor arguments are passed through unchanged and must
+    be the same objects on every call (they are baked into the graph). ``freeze()`` stops capturing:
+    signatures not captured by then run eagerly.
+    """
+
+    def __init__(self, fn, *, max_graphs: int = 256) -> None:
+        self.fn = fn
+        self.max_graphs = int(max_graphs)
+        self.graphs: OrderedDict[tuple, tuple[list[torch.Tensor], torch.cuda.CUDAGraph, torch.Tensor]] = OrderedDict()
+        self.pool = torch.cuda.graph_pool_handle()
+        self.captures = 0
+        self.replays = 0
+        self.eager_calls = 0
+        self.frozen = False
+
+    def freeze(self) -> None:
+        self.frozen = True
+
+    def __call__(self, *args):
+        tensors = [(i, a) for i, a in enumerate(args) if isinstance(a, torch.Tensor)]
+        if (not tensors or any(a.device.type != "cuda" for _, a in tensors)
+                or torch.cuda.is_current_stream_capturing()):
+            self.eager_calls += 1
+            return self.fn(*args)
+        key = tuple((i, tuple(a.shape), a.dtype) for i, a in tensors)
+        entry = self.graphs.get(key)
+        if entry is None:
+            if self.frozen:
+                self.eager_calls += 1
+                return self.fn(*args)
+            entry = self._capture(args, tensors)
+            self.graphs[key] = entry
+            if len(self.graphs) > self.max_graphs:
+                self.graphs.popitem(last=False)
+        else:
+            self.graphs.move_to_end(key)
+        static_in, graph, out = entry
+        for (_, a), s in zip(tensors, static_in):
+            s.copy_(a)
+        graph.replay()
+        self.replays += 1
+        return out.clone()
+
+    def _capture(self, args, tensors):
+        static_in = [a.clone() for _, a in tensors]
+        sargs = list(args)
+        for (i, _), s in zip(tensors, static_in):
+            sargs[i] = s
+        stream = torch.cuda.Stream()
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream):
+            for _ in range(2):
+                self.fn(*sargs)
+        torch.cuda.current_stream().wait_stream(stream)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, pool=self.pool):
+            out = self.fn(*sargs)
+        self.captures += 1
+        return static_in, graph, out
