@@ -13,8 +13,8 @@ for more (at most IRODORI_MAX_BATCH), and runs the compatible ones as one Turing
   POST /tts    same body with a whole reply ("text" up to 2000 chars, "split"?=true) -> audio/wav
                (IRODORI_OUTPUT_SR=24000, mono, PCM 16), what the app plays. The reply is split into
                sentence-sized pieces (reply_split.py: IRODORI_SPLIT_TARGET=30 / _MIN=8 / _MAX=70),
-               synthesized as one batch, trimmed (IRODORI_TRIM_DB=-40) and joined with IRODORI_GAP_MS=200
-               of silence; X-Pieces / X-Segments (start of each piece in ms)
+               synthesized as one batch and joined with IRODORI_GAP_MS=200 of silence (IRODORI_TRIM=1 also
+               cuts each piece's lead-in / tail first; off by default); X-Pieces / X-Segments (start of each piece in ms)
   GET  /health
 
 env: IRODORI_MODEL=small|small-mf  IRODORI_PORT=8097  IRODORI_HOST=127.0.0.1
@@ -494,7 +494,7 @@ def health():
         "batches": _state["worker"].batches if "worker" in _state else 0,
         "oom_retries": _state["worker"].oom_retries if "worker" in _state else 0,
         "split": {"target": reply_split.TARGET, "min": reply_split.MIN_LEN, "max": reply_split.HARD_MAX,
-                  "gap_ms": GAP_MS},
+                  "gap_ms": GAP_MS, "trim": TRIM},
         "graphs": ({"kept": len(g.graphs), "captures": g.captures, "replays": g.replays,
                     "eager_calls": g.eager_calls, "frozen": g.frozen}
                    if (g := getattr(_state.get("batcher"), "graphs", None)) is not None else None),
@@ -538,6 +538,9 @@ OUTPUT_SR = int(os.environ.get("IRODORI_OUTPUT_SR", "24000"))
 # the pause between the pieces of a reply (the old VOICEVOX path of coreapi used 200 ms), and the level
 # below a piece's peak that counts as silence when its lead-in / tail is trimmed before the pause
 GAP_MS = int(os.environ.get("IRODORI_GAP_MS", "200"))
+# trimming is off by default: kiyo found the pause after a trimmed piece unnatural (2026-11-20). The
+# model's own lead-in / tail is kept and GAP_MS is added on top
+TRIM = FLAG("IRODORI_TRIM", "0")
 TRIM_DB = float(os.environ.get("IRODORI_TRIM_DB", "-40"))
 TRIM_MARGIN_MS = int(os.environ.get("IRODORI_TRIM_MARGIN_MS", "30"))
 MAX_REPLY_CHARS = 2000
@@ -582,7 +585,8 @@ def _join(results) -> tuple[bytes, list[int]]:
     gap = np.zeros(sr * GAP_MS // 1000, dtype="<i2")
     out, starts, pos = [], [], 0
     for k, (pcm, _) in enumerate(pieces):
-        pcm = _trim(pcm, sr)
+        if TRIM:
+            pcm = _trim(pcm, sr)
         if k:
             out.append(gap)
             pos += len(gap)
@@ -604,8 +608,8 @@ async def tts(body: TtsIn):
 
     The text is split into sentence-sized pieces (reply_split; Irodori reads long text worse and clips
     it at 30 s). The pieces go into the queue together, so they are synthesized as one batch (with any
-    other requests that arrive at the same time), then they are trimmed and joined with GAP_MS of
-    silence. X-Segments has the start of each piece in ms. split=false reads the text as one piece."""
+    other requests that arrive at the same time), then joined with GAP_MS of silence (IRODORI_TRIM=1 trims
+    each piece first). X-Segments has the start of each piece in ms. split=false reads the text as one piece."""
     texts = reply_split.split_reply(body.text) if body.split else [body.text]
     if not texts or any(len(t) > MAX_TEXT_CHARS for t in texts):
         raise HTTPException(422, f"a piece is longer than {MAX_TEXT_CHARS} characters (split it)")
