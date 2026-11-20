@@ -494,6 +494,7 @@ def health():
         "batches": _state["worker"].batches if "worker" in _state else 0,
         "oom_retries": _state["worker"].oom_retries if "worker" in _state else 0,
         "split": {"target": reply_split.TARGET, "min": reply_split.MIN_LEN, "max": reply_split.HARD_MAX,
+                  "weights": reply_split.WEIGHTS,
                   "gap_ms": GAP_MS, "trim": TRIM},
         "graphs": ({"kept": len(g.graphs), "captures": g.captures, "replays": g.replays,
                     "eager_calls": g.eager_calls, "frozen": g.frozen}

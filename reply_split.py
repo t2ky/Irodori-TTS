@@ -6,16 +6,21 @@ max_seconds (30 s). Splitting a reply into sentences and joining them with a sho
 DNSMOS OVRL by ~0.3 on 80-180 character replies (2026-11-20). See TURING.md "Replies".
 
 A break mark has a strength w (0..1). A piece is cut after a mark when its length L reaches
-target * (1 - w): a full stop always cuts, "?" / "!" almost always, "…" from 40% of the target and
+target * (1 - w): a full stop always cuts, "?" / "!" almost always, "…" from 25% of the target and
 "、" from 70%. A text no longer than the target is not split at all. Pieces shorter than min_len are not cut (they run on into the next one), and a piece
 that would pass hard_max is cut at the strongest break seen so far (or, without any, right there).
 """
 from __future__ import annotations
 
+import json
 import os
 
-WEIGHTS = {"。": 1.0, "．": 1.0, "？": 0.9, "?": 0.9, "！": 0.9, "!": 0.9, "…": 0.6, "‥": 0.6,
+# "…" is 0.75 (was 0.6): "こんばんは、かな…ふふっ、でもね、…" ran on to the full stop as one 32-character
+# piece and came out muffled (kiyo 2026-11-21); at 0.75 it cuts after "かな…" (9 characters).
+# IRODORI_SPLIT_WEIGHTS='{"…": 0.8}' overrides single marks
+WEIGHTS = {"。": 1.0, "．": 1.0, "？": 0.9, "?": 0.9, "！": 0.9, "!": 0.9, "…": 0.75, "‥": 0.75,
            "、": 0.3, "，": 0.3, ",": 0.3}
+WEIGHTS.update({k: float(v) for k, v in json.loads(os.environ.get("IRODORI_SPLIT_WEIGHTS", "{}")).items()})
 # kept on the piece before the cut: closing brackets and trailing marks that belong to the sentence
 TRAIL = "」』）)】〉》♡♥♪〜～ー"
 
