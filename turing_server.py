@@ -10,7 +10,11 @@ for more (at most IRODORI_MAX_BATCH), and runs the compatible ones as one Turing
                 "cfg_scale_text"?, "cfg_scale_caption"?, "cfg_scale_speaker"?, "watermark"?}
             -> {"sample_rate", "audio"(base64 int16 LE mono), "seconds", "batch_size",
                 "audio_seconds", "model", "seed", "watermarked"}
-  POST /tts    same body -> audio/wav (IRODORI_OUTPUT_SR=24000, mono, PCM 16), what the app plays
+  POST /tts    same body with a whole reply ("text" up to 2000 chars, "split"?=true) -> audio/wav
+               (IRODORI_OUTPUT_SR=24000, mono, PCM 16), what the app plays. The reply is split into
+               sentence-sized pieces (reply_split.py: IRODORI_SPLIT_TARGET=30 / _MIN=8 / _MAX=70),
+               synthesized as one batch, trimmed (IRODORI_TRIM_DB=-40) and joined with IRODORI_GAP_MS=200
+               of silence; X-Pieces / X-Segments (start of each piece in ms)
   GET  /health
 
 env: IRODORI_MODEL=small|small-mf  IRODORI_PORT=8097  IRODORI_HOST=127.0.0.1
@@ -47,6 +51,7 @@ import base64
 import binascii
 import concurrent.futures
 import dataclasses
+import gc
 import hashlib
 import io
 import json
@@ -80,6 +85,8 @@ from irodori_tts.inference_runtime import (  # noqa: E402
     resolve_cfg_scales,
 )
 from irodori_tts.turing import TuringBatcher  # noqa: E402
+
+import reply_split  # noqa: E402
 
 log = logging.getLogger("turing_server")
 
@@ -186,6 +193,7 @@ class BatchWorker:
         self.pending: list[_Job] = []
         self.thread = threading.Thread(target=self._loop, name="tts-batch", daemon=True)
         self.batches = 0
+        self.oom_retries = 0
         self.thread.start()
 
     def submit(self, req: SamplingRequest, watermark: bool) -> concurrent.futures.Future:
@@ -223,31 +231,58 @@ class BatchWorker:
     def _loop(self) -> None:
         while True:
             batch = self._gather()
-            def on_row(i, res, batch=batch):  # answer each row as soon as it is decoded
-                job = batch[i]
-                if not job.future.done():
-                    job.future.set_result((res, time.perf_counter() - job.enqueued, len(batch)))
-
             try:
-                try:
-                    results = self.run([j.req for j in batch], watermark=batch[0].watermark,
-                                       on_row=on_row if ROW_STREAM else None)
-                except torch.OutOfMemoryError:
-                    # under IRODORI_CUDA_MEMORY_MB: give the cache back and try once more
-                    log.warning("batch hit the memory limit; retrying after emptying the cache")
-                    torch.cuda.empty_cache()
-                    results = self.run([j.req for j in batch], watermark=batch[0].watermark,
-                                       on_row=on_row if ROW_STREAM else None)
-                now = time.perf_counter()
-                for job, res in zip(batch, results, strict=True):
-                    if not job.future.done():
-                        job.future.set_result((res, now - job.enqueued, len(batch)))
+                self._run_jobs(batch)
             except Exception as exc:  # noqa: BLE001
                 log.warning("batch failed: %s", type(exc).__name__)
+                exc.__traceback__ = None  # the futures keep the exception; not the failed run's tensors
                 for job in batch:
                     if not job.future.done():
                         job.future.set_exception(exc)
+                del exc
+                gc.collect()
+                torch.cuda.empty_cache()
             self.batches += 1
+
+    def _run_jobs(self, batch: list[_Job], retried: bool = False) -> None:
+        """Run a batch and answer its jobs. Under IRODORI_CUDA_MEMORY_MB a batch can run out of memory
+        (the peak depends on fragmentation and on the length check's second pass, not only on the
+        batch's size): then give the cache back and run the jobs not answered yet in two halves, down
+        to one job, which gets one more try before it fails. The other jobs wait in the meantime."""
+        def on_row(i, res):  # answer each row as soon as it is decoded
+            job = batch[i]
+            if not job.future.done():
+                job.future.set_result((res, time.perf_counter() - job.enqueued, len(batch)))
+
+        results = None
+        try:
+            results = self.run([j.req for j in batch], watermark=batch[0].watermark,
+                               on_row=on_row if ROW_STREAM else None)
+        except torch.OutOfMemoryError:
+            pass  # retried below: inside this block the traceback still holds the failed run's tensors
+        if results is None:
+            gc.collect()
+            torch.cuda.empty_cache()
+            left = [j for j in batch if not j.future.done()]
+            self.oom_retries += 1
+            if len(left) > 1:
+                log.warning("batch of %d hit the memory limit; running the %d left in halves",
+                            len(batch), len(left))
+                half = (len(left) + 1) // 2
+                self._run_jobs(left[:half])
+                self._run_jobs(left[half:])
+                return
+            if left and not retried:
+                log.warning("one row hit the memory limit; retrying after emptying the cache")
+                self._run_jobs(left, retried=True)
+                return
+            if left:
+                raise torch.OutOfMemoryError("one row does not fit under IRODORI_CUDA_MEMORY_MB")
+            return
+        now = time.perf_counter()
+        for job, res in zip(batch, results, strict=True):
+            if not job.future.done():
+                job.future.set_result((res, now - job.enqueued, len(batch)))
 
     def run(self, reqs: list[SamplingRequest], *, watermark: bool = True, on_row=None):
         rt = self.rt
@@ -457,6 +492,9 @@ def health():
         "max_batch": MAX_BATCH,
         "batch_window_ms": WINDOW * 1000.0,
         "batches": _state["worker"].batches if "worker" in _state else 0,
+        "oom_retries": _state["worker"].oom_retries if "worker" in _state else 0,
+        "split": {"target": reply_split.TARGET, "min": reply_split.MIN_LEN, "max": reply_split.HARD_MAX,
+                  "gap_ms": GAP_MS},
         "graphs": ({"kept": len(g.graphs), "captures": g.captures, "replays": g.replays,
                     "eager_calls": g.eager_calls, "frozen": g.frozen}
                    if (g := getattr(_state.get("batcher"), "graphs", None)) is not None else None),
@@ -497,27 +535,89 @@ async def _synthesize(body: SynthIn):
 OUTPUT_SR = int(os.environ.get("IRODORI_OUTPUT_SR", "24000"))
 
 
-def _wav_bytes(audio: torch.Tensor, sr: int) -> bytes:
+# the pause between the pieces of a reply (the old VOICEVOX path of coreapi used 200 ms), and the level
+# below a piece's peak that counts as silence when its lead-in / tail is trimmed before the pause
+GAP_MS = int(os.environ.get("IRODORI_GAP_MS", "200"))
+TRIM_DB = float(os.environ.get("IRODORI_TRIM_DB", "-40"))
+TRIM_MARGIN_MS = int(os.environ.get("IRODORI_TRIM_MARGIN_MS", "30"))
+MAX_REPLY_CHARS = 2000
+
+
+def _pcm(audio: torch.Tensor, sr: int) -> tuple[np.ndarray, int]:
+    """float audio -> int16 at IRODORI_OUTPUT_SR"""
     import torchaudio.functional as AF
 
     x = audio.detach().float().reshape(1, -1).cpu()
     if OUTPUT_SR and sr != OUTPUT_SR:
         x = AF.resample(x, sr, OUTPUT_SR)
         sr = OUTPUT_SR
-    pcm = (np.clip(x.reshape(-1).numpy(), -1.0, 1.0) * 32767.0).astype("<i2")
+    return (np.clip(x.reshape(-1).numpy(), -1.0, 1.0) * 32767.0).astype("<i2"), sr
+
+
+def _trim(pcm: np.ndarray, sr: int) -> np.ndarray:
+    """Cut the silence before and after a piece (a piece ends with ~0.2 s of it on average, up to
+    1.1 s), keeping TRIM_MARGIN_MS, so that the pause between pieces is GAP_MS and not more."""
+    x = pcm.astype(np.float32)
+    win = max(1, sr // 100)  # 10 ms
+    env = np.sqrt(np.convolve(x * x, np.ones(win) / win, "same"))
+    loud = np.flatnonzero(env > env.max() * 10 ** (TRIM_DB / 20)) if env.max() > 0 else []
+    if len(loud) == 0:
+        return pcm
+    m = sr * TRIM_MARGIN_MS // 1000
+    return pcm[max(int(loud[0]) - m, 0): int(loud[-1]) + m]
+
+
+def _wav(pcm: np.ndarray, sr: int) -> bytes:
     buf = io.BytesIO()
     sf.write(buf, pcm, sr, subtype="PCM_16", format="WAV")
     return buf.getvalue()
 
 
+def _join(results) -> tuple[bytes, list[int]]:
+    """Pieces -> one WAV with GAP_MS between them, and the start of each piece in ms."""
+    pieces = [_pcm(r.audio, int(r.sample_rate)) for r in results]
+    sr = pieces[0][1]
+    if len(pieces) == 1:
+        return _wav(pieces[0][0], sr), [0]
+    gap = np.zeros(sr * GAP_MS // 1000, dtype="<i2")
+    out, starts, pos = [], [], 0
+    for k, (pcm, _) in enumerate(pieces):
+        pcm = _trim(pcm, sr)
+        if k:
+            out.append(gap)
+            pos += len(gap)
+        starts.append(pos * 1000 // sr)
+        out.append(pcm)
+        pos += len(pcm)
+    return _wav(np.concatenate(out), sr), starts
+
+
+class TtsIn(SynthIn):
+    # a whole reply: it is split into pieces of about IRODORI_SPLIT_TARGET characters (reply_split)
+    text: str = Field(..., min_length=1, max_length=MAX_REPLY_CHARS)
+    split: bool = True
+
+
 @app.post("/tts")
-async def tts(body: SynthIn):
-    """One sentence -> audio/wav (IRODORI_OUTPUT_SR, mono, PCM 16). Send the sentences of a reply
-    concurrently: requests that arrive together are synthesized as one batch."""
-    result, elapsed, batch_size = await _synthesize(body)
-    wav = await asyncio.to_thread(_wav_bytes, result.audio, int(result.sample_rate))
+async def tts(body: TtsIn):
+    """A reply -> audio/wav (IRODORI_OUTPUT_SR, mono, PCM 16), what the app plays.
+
+    The text is split into sentence-sized pieces (reply_split; Irodori reads long text worse and clips
+    it at 30 s). The pieces go into the queue together, so they are synthesized as one batch (with any
+    other requests that arrive at the same time), then they are trimmed and joined with GAP_MS of
+    silence. X-Segments has the start of each piece in ms. split=false reads the text as one piece."""
+    texts = reply_split.split_reply(body.text) if body.split else [body.text]
+    if not texts or any(len(t) > MAX_TEXT_CHARS for t in texts):
+        raise HTTPException(422, f"a piece is longer than {MAX_TEXT_CHARS} characters (split it)")
+    t0 = time.perf_counter()
+    outs = await asyncio.gather(*(_synthesize(body.model_copy(update={"text": t})) for t in texts))
+    wav, starts = await asyncio.to_thread(_join, [o[0] for o in outs])
     return Response(wav, media_type="audio/wav", headers={
-        "X-Synth-Seconds": f"{elapsed:.4f}", "X-Batch-Size": str(batch_size)})
+        "X-Synth-Seconds": f"{time.perf_counter() - t0:.4f}",
+        "X-Batch-Size": str(max(o[2] for o in outs)),
+        "X-Pieces": str(len(texts)),
+        "X-Segments": ",".join(map(str, starts)),
+    })
 
 
 @app.post("/synth")

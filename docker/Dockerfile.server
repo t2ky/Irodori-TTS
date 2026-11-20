@@ -27,7 +27,7 @@ COPY --from=hf models--Aratako--Semantic-DACVAE-Japanese-32dim /opt/hf/hub/model
 COPY --from=hf models--sony--silentcipher /opt/hf/hub/models--sony--silentcipher
 
 COPY irodori_tts ./irodori_tts
-COPY turing_server.py ./
+COPY turing_server.py reply_split.py ./
 COPY bench/bench.py bench/load.py bench/mem.py bench/make_latent.py bench/texts.json ./bench/
 
 ENV PATH=/opt/venv/bin:$PATH PYTHONUNBUFFERED=1 PYTHONWARNINGS=ignore \
