@@ -42,8 +42,8 @@ env: IRODORI_MODEL=small|small-mf  IRODORI_PORT=8097  IRODORI_HOST=127.0.0.1
      IRODORI_SPEECH_CHECK=1: on /tts, score every piece against its text (speech_check.py: phoneme CTC +
      forced alignment) and synthesize a piece that scores below IRODORI_SPEECH_CHECK_MIN=-2.0 once more
      with another seed, keeping the better one. Counts and scores (no text) go to the log and to
-     IRODORI_SPEECH_CHECK_LOG (JSON lines); /health has the totals. IRODORI_SPEECH_CHECK_HMAC_KEY adds keyed
-     hashes of the reply / piece to each line (find a reported reply with speech_check_lookup.py)
+     IRODORI_SPEECH_CHECK_LOG (JSON lines); /health has the totals. Each line has hashes of the reply / piece
+     (find a reported reply with speech_check_lookup.py)
 
 Privacy: request text / caption are never logged or written to disk; reference audio is written
 once (named by its sha256) to a private tmpfs dir for the runtime's latent cache and removed at

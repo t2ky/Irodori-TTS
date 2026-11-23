@@ -17,16 +17,14 @@ Measured on 1158 pieces of v29 replies (2026-11-23, 3090): score < -2.0 flags 1.
 as many correct pieces). Pieces that are only breath / interjections ("はぁっ…はぁっ…！") and pieces with
 Latin letters (their g2p reading is unreliable) are scored and logged but never retried.
 
-Privacy: the text itself is never logged. With IRODORI_SPEECH_CHECK_HMAC_KEY set, each line also carries
-keyed hashes of the reply and of the piece (HMAC-SHA256 of the normalized text, 16 hex digits), so that a
-reply reported as misread ("this reply skipped a word") can be found in the log by hashing it with the same
-key (speech_check_lookup.py). Without the key a hash cannot be matched against guessed texts, which a plain
-hash of short replies ("うん。") would allow.
+Privacy: the text itself is never logged. Each line carries a hash of the reply and of the piece (SHA-256
+of the normalized text, 16 hex digits), so that a reply reported as misread ("this reply skipped a word")
+can be found in the log (speech_check_lookup.py). A hash of a common short line ("うん。") can be guessed,
+but such a line says nothing about the conversation; a reply worth keeping private cannot be guessed back.
 """
 from __future__ import annotations
 
 import hashlib
-import hmac
 import json
 import logging
 import os
@@ -47,19 +45,13 @@ MIN_PHONEMES = int(os.environ.get("IRODORI_SPEECH_CHECK_MIN_PHONEMES", "6"))
 PAD_S = 0.5
 LOG_PATH = os.environ.get("IRODORI_SPEECH_CHECK_LOG")  # JSON lines appended here as well as to stdout
 
-_HMAC_KEY = os.environ.get("IRODORI_SPEECH_CHECK_HMAC_KEY", "").encode() or None
-
-
 def normalize(text: str) -> str:
     """What is hashed: NFKC, no whitespace (a reply copied out of the app keeps its words, not its spacing)."""
     return re.sub(r"\s+", "", unicodedata.normalize("NFKC", text))
 
 
-def text_hash(text: str, key: bytes | None = None) -> str | None:
-    key = key if key is not None else _HMAC_KEY
-    if not key:
-        return None
-    return hmac.new(key, normalize(text).encode(), hashlib.sha256).hexdigest()[:16]
+def text_hash(text: str) -> str:
+    return hashlib.sha256(normalize(text).encode()).hexdigest()[:16]
 
 
 # pieces that are only breath, interjections and marks: their "expected" phonemes say little
