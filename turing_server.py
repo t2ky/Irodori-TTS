@@ -640,18 +640,22 @@ async def tts(body: TtsIn):
 
 
 def _score_piece(check, res, phonemes):
-    pcm, sr = _pcm(res.audio, int(res.sample_rate))
-    score, heard = check.score(pcm, sr, phonemes)
-    return score, heard, round(len(pcm) / sr, 3)
+    sr = int(res.sample_rate)
+    score, heard = check.score(res.audio, sr, phonemes)
+    return score, heard, round(res.audio.numel() / sr, 3)
 
 
 async def _check_pieces(check, body, texts, results, t0):
     """Score each piece (speech_check.py); synthesize the low ones once more with another seed and keep
     the better take. One JSON line per piece: counts and scores only, never the text."""
     req_id = os.urandom(4).hex()
+    synth_ms = round((time.perf_counter() - t0) * 1000)
     phs = [check.expected(t) for t in texts]
     skips = [speech_check.reason_to_skip(t, len(p)) for t, p in zip(texts, phs)]
-    scored = await asyncio.gather(*(asyncio.to_thread(_score_piece, check, r, p) for r, p in zip(results, phs)))
+    # one thread for all the pieces: a thread per piece fought the batch worker for the GIL
+    tc = time.perf_counter()
+    scored = await asyncio.to_thread(lambda: [_score_piece(check, r, p) for r, p in zip(results, phs)])
+    check_ms = round((time.perf_counter() - tc) * 1000)
     low = [i for i, ((sc, _, _), sk) in enumerate(zip(scored, skips)) if sk is None and sc < speech_check.MIN_SCORE]
     second = {}
     if low:
@@ -665,7 +669,8 @@ async def _check_pieces(check, body, texts, results, t0):
     out = list(results)
     for i, (t, p, sk, (sc, heard, dur)) in enumerate(zip(texts, phs, skips, scored)):
         rec = {"ts": round(time.time(), 3), "req": req_id, "voice": body.voice, "piece": i, "pieces": len(texts),
-               "chars": len(t), "phonemes": len(p), "heard": heard, "sec": dur, "score": round(sc, 3), "skip": sk}
+               "chars": len(t), "phonemes": len(p), "heard": heard, "sec": dur, "score": round(sc, 3), "skip": sk,
+               "synth_ms": synth_ms, "check_ms": check_ms}
         check.count("skipped" if sk else "checked")
         if i in low:
             check.count("flagged")
@@ -674,10 +679,12 @@ async def _check_pieces(check, body, texts, results, t0):
                 res2, sc2, heard2, dur2 = second[i]
                 check.count("retried")
                 rec.update(score2=round(sc2, 3), heard2=heard2, sec2=dur2, kept=2 if sc2 > sc else 1)
+                rec["redo_ms"] = round((time.perf_counter() - t0) * 1000) - synth_ms - check_ms
                 if sc2 > sc:
                     out[i] = res2
                 check.count("recovered" if max(sc, sc2) >= speech_check.MIN_SCORE else "still_low")
         check.write(rec)
+    redo_ms = round((time.perf_counter() - t0) * 1000) - synth_ms - check_ms
     if low:
         log.warning("speech check: %d of %d pieces low, %d retried (%.2fs in all)", len(low), len(texts),
                     len(second), time.perf_counter() - t0)
