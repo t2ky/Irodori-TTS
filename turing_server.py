@@ -39,6 +39,10 @@ env: IRODORI_MODEL=small|small-mf  IRODORI_PORT=8097  IRODORI_HOST=127.0.0.1
      IRODORI_GRAPH_WARM_ROWS=4 / _TOKENS=64 / _SECONDS=15: the DiT shapes captured at warm-up (with
      IRODORI_GRAPHS=1 and registered voices); other shapes run eagerly after the freeze
      IRODORI_WARMUP_LONG_TEXT: the longest text of the warm-up; it sizes the graphs (see _warmup)
+     IRODORI_SPEECH_CHECK=1: on /tts, score every piece against its text (speech_check.py: phoneme CTC +
+     forced alignment) and synthesize a piece that scores below IRODORI_SPEECH_CHECK_MIN=-2.0 once more
+     with another seed, keeping the better one. Counts and scores (no text) go to the log and to
+     IRODORI_SPEECH_CHECK_LOG (JSON lines); /health has the totals
 
 Privacy: request text / caption are never logged or written to disk; reference audio is written
 once (named by its sha256) to a private tmpfs dir for the runtime's latent cache and removed at
@@ -87,6 +91,7 @@ from irodori_tts.inference_runtime import (  # noqa: E402
 from irodori_tts.turing import TuringBatcher  # noqa: E402
 
 import reply_split  # noqa: E402
+import speech_check  # noqa: E402
 
 log = logging.getLogger("turing_server")
 
@@ -419,6 +424,8 @@ async def lifespan(app: FastAPI):
         sync_timings=False,
     )
     _state.update(rt=rt, batcher=batcher)
+    if FLAG("IRODORI_SPEECH_CHECK", "0"):
+        _state["check"] = speech_check.SpeechCheck("cuda")
     worker = BatchWorker(rt, batcher)
     _state["worker"] = worker
     log.warning("loaded %s (%s) in %.1fs", MODEL, PRECISION, time.perf_counter() - t0)
@@ -500,6 +507,8 @@ def health():
                     "eager_calls": g.eager_calls, "frozen": g.frozen}
                    if (g := getattr(_state.get("batcher"), "graphs", None)) is not None else None),
         "voices": sorted(_voice_files()),
+        "speech_check": ({"min_score": speech_check.MIN_SCORE, **c.counts}
+                         if (c := _state.get("check")) is not None else None),
     }
 
 
@@ -616,13 +625,63 @@ async def tts(body: TtsIn):
         raise HTTPException(422, f"a piece is longer than {MAX_TEXT_CHARS} characters (split it)")
     t0 = time.perf_counter()
     outs = await asyncio.gather(*(_synthesize(body.model_copy(update={"text": t})) for t in texts))
-    wav, starts = await asyncio.to_thread(_join, [o[0] for o in outs])
+    results = [o[0] for o in outs]
+    retried = 0
+    if (check := _state.get("check")) is not None:
+        results, retried = await _check_pieces(check, body, texts, results, t0)
+    wav, starts = await asyncio.to_thread(_join, results)
     return Response(wav, media_type="audio/wav", headers={
         "X-Synth-Seconds": f"{time.perf_counter() - t0:.4f}",
         "X-Batch-Size": str(max(o[2] for o in outs)),
         "X-Pieces": str(len(texts)),
         "X-Segments": ",".join(map(str, starts)),
+        "X-Retried": str(retried),
     })
+
+
+def _score_piece(check, res, phonemes):
+    pcm, sr = _pcm(res.audio, int(res.sample_rate))
+    score, heard = check.score(pcm, sr, phonemes)
+    return score, heard, round(len(pcm) / sr, 3)
+
+
+async def _check_pieces(check, body, texts, results, t0):
+    """Score each piece (speech_check.py); synthesize the low ones once more with another seed and keep
+    the better take. One JSON line per piece: counts and scores only, never the text."""
+    req_id = os.urandom(4).hex()
+    phs = [check.expected(t) for t in texts]
+    skips = [speech_check.reason_to_skip(t, len(p)) for t, p in zip(texts, phs)]
+    scored = await asyncio.gather(*(asyncio.to_thread(_score_piece, check, r, p) for r, p in zip(results, phs)))
+    low = [i for i, ((sc, _, _), sk) in enumerate(zip(scored, skips)) if sk is None and sc < speech_check.MIN_SCORE]
+    second = {}
+    if low:
+        base = DEFAULT_SEED if body.seed is None else int(body.seed)
+        redo = await asyncio.gather(*(_synthesize(body.model_copy(update={"text": texts[i], "seed": base + 7919 * (i + 1)}))
+                                      for i in low), return_exceptions=True)
+        for i, o in zip(low, redo):
+            if isinstance(o, BaseException):
+                continue
+            second[i] = (o[0], *(await asyncio.to_thread(_score_piece, check, o[0], phs[i])))
+    out = list(results)
+    for i, (t, p, sk, (sc, heard, dur)) in enumerate(zip(texts, phs, skips, scored)):
+        rec = {"ts": round(time.time(), 3), "req": req_id, "voice": body.voice, "piece": i, "pieces": len(texts),
+               "chars": len(t), "phonemes": len(p), "heard": heard, "sec": dur, "score": round(sc, 3), "skip": sk}
+        check.count("skipped" if sk else "checked")
+        if i in low:
+            check.count("flagged")
+            rec["retried"] = i in second
+            if i in second:
+                res2, sc2, heard2, dur2 = second[i]
+                check.count("retried")
+                rec.update(score2=round(sc2, 3), heard2=heard2, sec2=dur2, kept=2 if sc2 > sc else 1)
+                if sc2 > sc:
+                    out[i] = res2
+                check.count("recovered" if max(sc, sc2) >= speech_check.MIN_SCORE else "still_low")
+        check.write(rec)
+    if low:
+        log.warning("speech check: %d of %d pieces low, %d retried (%.2fs in all)", len(low), len(texts),
+                    len(second), time.perf_counter() - t0)
+    return out, len(second)
 
 
 @app.post("/synth")

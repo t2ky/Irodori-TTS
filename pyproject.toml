@@ -25,6 +25,7 @@ dependencies = [
     "tqdm>=4.67.3",
     "wandb>=0.17.0",
     "torchdata>=0.11.0",
+    "pyopenjtalk-plus>=0.4",
 ]
 
 [project.optional-dependencies]

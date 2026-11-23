@@ -13,21 +13,25 @@ FROM python:3.10-slim-bookworm
 RUN apt-get update && apt-get install -y --no-install-recommends \
       gcc g++ git libsndfile1 ffmpeg curl ca-certificates \
     && rm -rf /var/lib/apt/lists/*
-COPY --from=ghcr.io/astral-sh/uv:0.9.7 /uv /usr/local/bin/uv
+COPY --from=ghcr.io/astral-sh/uv:0.13.8 /uv /usr/local/bin/uv
 
 WORKDIR /app
 ENV UV_LINK_MODE=copy UV_COMPILE_BYTECODE=1 UV_PROJECT_ENVIRONMENT=/opt/venv
 COPY pyproject.toml uv.lock ./
 RUN uv sync --frozen --no-install-project --no-dev --extra cu128 && rm -rf /root/.cache
+# pyopenjtalk's dictionary at build time (speech_check.py reads the text with it; the image runs offline)
+RUN /opt/venv/bin/python -c "import pyopenjtalk; print(pyopenjtalk.g2p('辞書の確認'))"
 
 ENV HF_HOME=/opt/hf HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1
 COPY --from=hf models--Aratako--Irodori-TTS-v4.1-Small-MF /opt/hf/hub/models--Aratako--Irodori-TTS-v4.1-Small-MF
 COPY --from=hf models--Aratako--Irodori-TTS-v4.1-Small    /opt/hf/hub/models--Aratako--Irodori-TTS-v4.1-Small
 COPY --from=hf models--Aratako--Semantic-DACVAE-Japanese-32dim /opt/hf/hub/models--Aratako--Semantic-DACVAE-Japanese-32dim
 COPY --from=hf models--sony--silentcipher /opt/hf/hub/models--sony--silentcipher
+# speech_check.py: phoneme CTC that scores each piece of a reply against its text (IRODORI_SPEECH_CHECK=1)
+COPY --from=hf models--prj-beatrice--japanese-hubert-base-phoneme-ctc-v4 /opt/hf/hub/models--prj-beatrice--japanese-hubert-base-phoneme-ctc-v4
 
 COPY irodori_tts ./irodori_tts
-COPY turing_server.py reply_split.py ./
+COPY turing_server.py reply_split.py speech_check.py ./
 COPY bench/bench.py bench/load.py bench/mem.py bench/make_latent.py bench/texts.json ./bench/
 
 ENV PATH=/opt/venv/bin:$PATH PYTHONUNBUFFERED=1 PYTHONWARNINGS=ignore \
