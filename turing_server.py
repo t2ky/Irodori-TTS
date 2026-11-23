@@ -42,7 +42,8 @@ env: IRODORI_MODEL=small|small-mf  IRODORI_PORT=8097  IRODORI_HOST=127.0.0.1
      IRODORI_SPEECH_CHECK=1: on /tts, score every piece against its text (speech_check.py: phoneme CTC +
      forced alignment) and synthesize a piece that scores below IRODORI_SPEECH_CHECK_MIN=-2.0 once more
      with another seed, keeping the better one. Counts and scores (no text) go to the log and to
-     IRODORI_SPEECH_CHECK_LOG (JSON lines); /health has the totals
+     IRODORI_SPEECH_CHECK_LOG (JSON lines); /health has the totals. IRODORI_SPEECH_CHECK_HMAC_KEY adds keyed
+     hashes of the reply / piece to each line (find a reported reply with speech_check_lookup.py)
 
 Privacy: request text / caption are never logged or written to disk; reference audio is written
 once (named by its sha256) to a private tmpfs dir for the runtime's latent cache and removed at
@@ -649,6 +650,7 @@ async def _check_pieces(check, body, texts, results, t0):
     """Score each piece (speech_check.py); synthesize the low ones once more with another seed and keep
     the better take. One JSON line per piece: counts and scores only, never the text."""
     req_id = os.urandom(4).hex()
+    reply_hash = speech_check.text_hash(body.text)
     synth_ms = round((time.perf_counter() - t0) * 1000)
     phs = [check.expected(t) for t in texts]
     skips = [speech_check.reason_to_skip(t, len(p)) for t, p in zip(texts, phs)]
@@ -668,7 +670,8 @@ async def _check_pieces(check, body, texts, results, t0):
             second[i] = (o[0], *(await asyncio.to_thread(_score_piece, check, o[0], phs[i])))
     out = list(results)
     for i, (t, p, sk, (sc, heard, dur)) in enumerate(zip(texts, phs, skips, scored)):
-        rec = {"ts": round(time.time(), 3), "req": req_id, "voice": body.voice, "piece": i, "pieces": len(texts),
+        rec = {"ts": round(time.time(), 3), "req": req_id, "reply_hash": reply_hash, "piece_hash": speech_check.text_hash(t),
+               "voice": body.voice, "piece": i, "pieces": len(texts),
                "chars": len(t), "phonemes": len(p), "heard": heard, "sec": dur, "score": round(sc, 3), "skip": sk,
                "synth_ms": synth_ms, "check_ms": check_ms}
         check.count("skipped" if sk else "checked")
