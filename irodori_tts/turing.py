@@ -539,8 +539,14 @@ class TuringBatcher:
             batch_kwargs = {"sequence_length": seq_len, "initial_noise": noise}
         first = plans[0]
         t0 = self._mstart(device)
-        # speaker_kv_scale rescales the context K/V in place between steps: keep it eager
-        use_graphs = first.speaker_kv_scale is None
+        # speaker_kv_scale rescales the context K/V in place between steps: keep it eager. A scale of
+        # 1.0 multiplies by one, and with the context K/V cache already on (the default) it changes
+        # nothing else either, so it runs as None and keeps the graphs. voices.json gives every voice
+        # 1.0; without this no DiT call ever hit a graph (#969)
+        kv_scale = first.speaker_kv_scale
+        if kv_scale == 1.0 and first.req.context_kv_cache:
+            kv_scale = None
+        use_graphs = kv_scale is None
         recorder = _BatchPointer(model, len(plans)) if record_pointer else None
         with self._reuse_encoded(encoded, use_graphs=use_graphs,
                                  recorder=recorder, last_call=first.num_steps):
@@ -569,7 +575,7 @@ class TuringBatcher:
                     rescale_k=first.rescale_k,
                     rescale_sigma=first.rescale_sigma,
                     use_context_kv_cache=bool(first.req.context_kv_cache),
-                    speaker_kv_scale=first.speaker_kv_scale,
+                    speaker_kv_scale=kv_scale,
                     speaker_kv_max_layers=first.speaker_kv_max_layers,
                     speaker_kv_min_t=first.speaker_kv_min_t,
                     t_schedule_mode=str(first.req.t_schedule_mode),
